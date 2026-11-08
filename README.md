@@ -1,12 +1,16 @@
-# Your AImate · 小克
+**繁體中文** · [English](README.en.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-小克是一個住在 Windows 桌面角落的 2D 角色。你打字或按住麥克風跟她說話，她用你自己的 Claude 帳號想答案，再用在你電腦上合成的聲音說出來。
+# AImate
 
-<p align="center"><img src=".github/readme/xiaoke.png" alt="小克的兩套衣服：制服和禮服" width="400"></p>
+**AImate：把自己常用的AI打造虛擬人物、虛擬助理協助處理事情**
+
+AImate 是住在 Windows 桌面角落的 2D 助理，長相、名字、個性和聲音都可以自己設計。你打字或按住麥克風跟她說話，她用你自己的 AI 帳號想答案，再用在你電腦上合成的聲音說出來。目前接的 AI 是 Claude（透過 Claude Code）。
+
+預設角色是小克，有制服和禮服兩套衣服。想換成你自己的角色，照[角色教學](guide/character.md)做。
+
+<p align="center"><img src=".github/readme/xiaoke.png" alt="預設角色小克的兩套衣服：制服和禮服" width="400"></p>
 
 <p align="center"><a href="https://ko-fi.com/Sagittarius1205"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi"></a></p>
-
-*A desktop companion for Windows. She answers through your own Claude Code login and speaks with a local voice. The app and docs are in Traditional Chinese.*
 
 > 這是個人的開源專案，不是 Anthropic 的官方產品，和 Anthropic 沒有關係。
 
@@ -17,7 +21,7 @@
 - **用本機的聲音說話。** 語音由 VoxCPM2 在你的顯示卡上合成，嘴型跟著聲音動。她的聲音是用文字描述合成出來的，沒有用任何真人的錄音。
 - **在本機聽懂你。** 語音辨識用 SenseVoice，支援中、英、日、韓、粵語，聲音不會傳出你的電腦。
 - **會動。** 眼睛和身體跟著游標轉，說話時有手勢，會眨眼。
-- **可以換。** 兩套衣服、兩個介面主題（紙本、夜色），也可以放進你自己的角色。
+- **自己設計。** 換成你自己的角色：圖、名字、個性、開場白、口頭禪、聲音都能換。介面主題也能自己做，內建紙本和夜色兩種。
 
 沒有顯示卡也能用：語音服務沒開的時候，她只會顯示文字，不出聲音。
 
@@ -83,32 +87,15 @@ powershell -ExecutionPolicy Bypass -File Scripts\start_pet.ps1
 - 角色旁邊有「設定」「結束」「對話」三個按鈕。設定有角色、聲音、外觀、開關、模型五個分頁，「開關」裡可以設定開機時啟動。
 - 「結束」會關掉桌寵、對話核心和語音辨識。語音服務會留著，下次啟動就不用再等模型載入。
 
-## 放進你自己的角色
+## 設計你自己的角色
 
-一個角色是一個資料夾。最簡單的做法：在設定的「角色」分頁按「複製到我的資料夾」，再改複製出來的那一份。它會放在 `%USERPROFILE%\.vrpet\characters\<id>\`。
+一個角色是一個資料夾，放進 `%USERPROFILE%\.vrpet\characters\` 再重開桌寵，就能在設定裡換成她，不用重新建置。
 
-資料夾裡有這些檔案：
+- **只改名字和個性：** 在設定的「角色」分頁按「複製到我的資料夾」，改複製出來的那一份，按「存檔」。
+- **換成另一張圖：** 用能改圖的 AI 做出同一張圖的五個版本，再用 `Scripts\live2d\` 的兩支腳本切成圖層。
+- **換聲音：** 放一段 `voice.wav`，她就用那個聲音說話。
 
-| 檔案 | 必要 | 內容 |
-| --- | --- | --- |
-| `character.json` | 是 | 名字、個性、開場白，見下面的例子 |
-| `layers.json`、`rig.json` | 是 | 有哪些圖層、每一層怎麼動。照 `Pet/ui/characters/char-20261107/` 改最快 |
-| `*.png` | 是 | 圖層 |
-| `voice.wav` | 否 | 她的聲音的參考音檔，語音服務用它模仿聲音 |
-| `fillers.json` | 否 | 預先合成的口頭禪，用 `Scripts\tts_engines\render_fillers.py` 產生 |
-
-```json
-{
-  "name": "小毛",
-  "outfit": "禮服",
-  "persona": "你住在使用者的桌面角落，講話短、口語。",
-  "greeting": "嗨，我在這裡。",
-  "voice": "voice.wav",
-  "fillers": ["嗯……", "我想想喔"]
-}
-```
-
-資料夾名稱只能用小寫英文、數字、`-` 和 `_`。不認得的欄位會被拒絕，設定視窗會寫出原因。改完要重開桌寵。
+完整的步驟、每個欄位的限制和排錯，見[角色教學](guide/character.md)。介面主題的做法也在同一份。
 
 ## 出問題的時候
 
@@ -134,7 +121,7 @@ Stt\target\debug\vrstt.exe selftest
 ## 授權
 
 - **程式碼：** MIT，見 [LICENSE](LICENSE)。
-- **小克的圖和聲音：** 不是 MIT。可以隨這個軟體（包括改過的版本）一起使用和散布，其他用途要先取得同意。見 [LICENSE-ASSETS.md](LICENSE-ASSETS.md)。
+- **預設角色小克的圖和聲音：** 不是 MIT。可以隨這個軟體（包括改過的版本）一起使用和散布，其他用途要先取得同意。見 [LICENSE-ASSETS.md](LICENSE-ASSETS.md)。
 - **不在這個 repo 裡、由你自己下載的模型：**
   - SenseVoice（[FunASR](https://github.com/modelscope/FunASR)，阿里巴巴通義實驗室）：FunASR Model Open Source License v1.1，使用時要標明來源和作者。這裡用的是 k2-fsa 轉成 ONNX 的 int8 版本。
   - Silero VAD：MIT。

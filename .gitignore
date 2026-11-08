@@ -17,6 +17,7 @@ __pycache__/
 *.pyc
 # The voice service venv. start_pet.ps1 looks here when VRPET_PYTHON is not set.
 .venv/
+.venv-art/
 
 # Secrets. API keys live in .env or environment variables, never in the repo.
 .env
