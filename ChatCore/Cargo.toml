@@ -1,0 +1,22 @@
+[package]
+name = "vrchatcore"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Loopback HTTP/1.1 to the local speech service, nothing more: default features off means no TLS
+# and no gzip. Pinned because the next unit (BaseUrl::parse, Docs/DESIGN_Voice.md 3.3) builds on
+# its exact timeout and redirect behaviour.
+ureq = { version = "=3.4.2", default-features = false }
+# Already in the tree through ureq, named here because the voice is encoded with it.
+base64 = "=0.23.1"
+
+[features]
+# https for a speech service the user declared (Docs/DESIGN_Voice.md 8, Docs/DESIGN_Settings.md 4):
+# rustls with ring and the webpki root set, through ureq. On by default since lin chose, on
+# 2026-11-07, that settings may name a cloud speech service, and a cloud service is https. Build
+# with --no-default-features for a loopback-only core; an https address is then refused by name.
+default = ["tls"]
+tls = ["ureq/rustls"]

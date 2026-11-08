@@ -1,0 +1,776 @@
+{
+  "art": "layers.json",
+  "parameters": [
+    {
+      "id": "ParamAngleX",
+      "min": -30,
+      "max": 30,
+      "default": 0
+    },
+    {
+      "id": "ParamAngleY",
+      "min": -30,
+      "max": 30,
+      "default": 0
+    },
+    {
+      "id": "ParamAngleZ",
+      "min": -30,
+      "max": 30,
+      "default": 0
+    },
+    {
+      "id": "ParamBodyAngleX",
+      "min": -10,
+      "max": 10,
+      "default": 0
+    },
+    {
+      "id": "ParamBodyAngleY",
+      "min": -10,
+      "max": 10,
+      "default": 0
+    },
+    {
+      "id": "ParamBodyAngleZ",
+      "min": -10,
+      "max": 10,
+      "default": 0
+    },
+    {
+      "id": "ParamEyeLOpen",
+      "min": 0,
+      "max": 1,
+      "default": 1
+    },
+    {
+      "id": "ParamEyeROpen",
+      "min": 0,
+      "max": 1,
+      "default": 1
+    },
+    {
+      "id": "ParamEyeBallX",
+      "min": -1,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "id": "ParamEyeBallY",
+      "min": -1,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "id": "ParamMouthOpenY",
+      "min": 0,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "id": "ParamBreath",
+      "min": 0,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "id": "ParamArmLA01",
+      "min": -10,
+      "max": 30,
+      "default": 0
+    },
+    {
+      "id": "ParamArmRA01",
+      "min": -10,
+      "max": 30,
+      "default": 0
+    },
+    {
+      "id": "ParamLeftShoulderUp",
+      "min": -10,
+      "max": 10,
+      "default": 0
+    },
+    {
+      "id": "ParamRightShoulderUp",
+      "min": -10,
+      "max": 10,
+      "default": 0
+    },
+    {
+      "id": "ParamHairFront",
+      "min": -1,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "id": "ParamHairBack",
+      "min": -1,
+      "max": 1,
+      "default": 0
+    },
+    {
+      "id": "ParamLegsTogether",
+      "min": 0,
+      "max": 1,
+      "default": 1
+    }
+  ],
+  "lipSync": "ParamMouthOpenY",
+  "eyeBlink": [
+    "ParamEyeLOpen",
+    "ParamEyeROpen"
+  ],
+  "nodes": [
+    {
+      "name": "skirt",
+      "pivot": [
+        510,
+        590
+      ],
+      "drive": [
+        {
+          "param": "ParamBodyAngleX",
+          "x": 0.3
+        },
+        {
+          "param": "ParamBodyAngleZ",
+          "rotate": 0.2
+        }
+      ]
+    },
+    {
+      "name": "body",
+      "pivot": [
+        510,
+        600
+      ],
+      "drive": [
+        {
+          "param": "ParamBodyAngleX",
+          "x": 0.8
+        },
+        {
+          "param": "ParamBodyAngleY",
+          "y": -0.8
+        },
+        {
+          "param": "ParamBodyAngleZ",
+          "rotate": 0.5
+        },
+        {
+          "param": "ParamBreath",
+          "y": -3
+        }
+      ]
+    },
+    {
+      "name": "head",
+      "parent": "body",
+      "pivot": [
+        507,
+        270
+      ],
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.5
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.8
+        },
+        {
+          "param": "ParamAngleZ",
+          "rotate": 0.5
+        }
+      ]
+    },
+    {
+      "name": "armRight",
+      "parent": "body",
+      "pivot": [
+        430,
+        318
+      ],
+      "drive": [
+        {
+          "param": "ParamArmRA01",
+          "rotate": 0.25
+        },
+        {
+          "param": "ParamRightShoulderUp",
+          "y": -1.2
+        },
+        {
+          "param": "ParamBodyAngleX",
+          "x": 0.6
+        }
+      ]
+    },
+    {
+      "name": "armLeft",
+      "parent": "body",
+      "pivot": [
+        612,
+        322
+      ],
+      "drive": [
+        {
+          "param": "ParamArmLA01",
+          "rotate": -1
+        },
+        {
+          "param": "ParamLeftShoulderUp",
+          "y": -1.2
+        },
+        {
+          "param": "ParamBodyAngleX",
+          "x": -0.6
+        }
+      ]
+    }
+  ],
+  "layers": {
+    "back_hair": {
+      "node": "head",
+      "pivot": [
+        512,
+        40
+      ],
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": -0.3
+        },
+        {
+          "param": "ParamAngleY",
+          "y": 0.2
+        },
+        {
+          "param": "ParamHairBack",
+          "rotate": 2
+        }
+      ]
+    },
+    "leg_image_left": {
+      "pivot": [
+        352,
+        866
+      ],
+      "drive": [
+        {
+          "param": "ParamLegsTogether",
+          "rotate": -2,
+          "at": 0
+        }
+      ]
+    },
+    "leg_image_right": {
+      "pivot": [
+        666,
+        862
+      ],
+      "drive": [
+        {
+          "param": "ParamLegsTogether",
+          "rotate": 2,
+          "at": 0
+        }
+      ]
+    },
+    "skirt": {
+      "node": "skirt"
+    },
+    "torso": {
+      "node": "body"
+    },
+    "arm_image_left": {
+      "node": "armRight"
+    },
+    "arm_image_right": {
+      "node": "armLeft"
+    },
+    "face": {
+      "node": "head"
+    },
+    "eye_white_image_left": {
+      "node": "head",
+      "pivot": [
+        462,
+        167
+      ],
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        },
+        {
+          "param": "ParamEyeROpen",
+          "sy": 0.6,
+          "at": 1
+        }
+      ],
+      "show": {
+        "param": "ParamEyeROpen",
+        "from": 0.3,
+        "to": 0.31
+      }
+    },
+    "iris_image_left": {
+      "node": "head",
+      "pivot": [
+        462,
+        167
+      ],
+      "clip": "eye_white_image_left",
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        },
+        {
+          "param": "ParamEyeBallX",
+          "x": 5
+        },
+        {
+          "param": "ParamEyeBallY",
+          "y": -4
+        },
+        {
+          "param": "ParamEyeROpen",
+          "sy": 0.6,
+          "at": 1
+        }
+      ],
+      "show": {
+        "param": "ParamEyeROpen",
+        "from": 0.3,
+        "to": 0.31
+      }
+    },
+    "eye_lash_image_left": {
+      "node": "head",
+      "pivot": [
+        462,
+        167
+      ],
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        },
+        {
+          "param": "ParamEyeROpen",
+          "sy": 0.6,
+          "at": 1
+        }
+      ],
+      "show": {
+        "param": "ParamEyeROpen",
+        "from": 0.3,
+        "to": 0.31
+      }
+    },
+    "eye_white_image_right": {
+      "node": "head",
+      "pivot": [
+        557,
+        165.5
+      ],
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        },
+        {
+          "param": "ParamEyeLOpen",
+          "sy": 0.6,
+          "at": 1
+        }
+      ],
+      "show": {
+        "param": "ParamEyeLOpen",
+        "from": 0.3,
+        "to": 0.31
+      }
+    },
+    "iris_image_right": {
+      "node": "head",
+      "pivot": [
+        557,
+        165.5
+      ],
+      "clip": "eye_white_image_right",
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        },
+        {
+          "param": "ParamEyeBallX",
+          "x": 5
+        },
+        {
+          "param": "ParamEyeBallY",
+          "y": -4
+        },
+        {
+          "param": "ParamEyeLOpen",
+          "sy": 0.6,
+          "at": 1
+        }
+      ],
+      "show": {
+        "param": "ParamEyeLOpen",
+        "from": 0.3,
+        "to": 0.31
+      }
+    },
+    "eye_lash_image_right": {
+      "node": "head",
+      "pivot": [
+        557,
+        165.5
+      ],
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        },
+        {
+          "param": "ParamEyeLOpen",
+          "sy": 0.6,
+          "at": 1
+        }
+      ],
+      "show": {
+        "param": "ParamEyeLOpen",
+        "from": 0.3,
+        "to": 0.31
+      }
+    },
+    "eye_image_left_closed": {
+      "node": "head",
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        }
+      ],
+      "show": {
+        "param": "ParamEyeROpen",
+        "from": 0.31,
+        "to": 0.3
+      }
+    },
+    "eye_image_right_closed": {
+      "node": "head",
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        }
+      ],
+      "show": {
+        "param": "ParamEyeLOpen",
+        "from": 0.31,
+        "to": 0.3
+      }
+    },
+    "brow_image_left": {
+      "node": "head",
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        },
+        {
+          "param": "ParamEyeROpen",
+          "y": -2,
+          "at": 1
+        }
+      ]
+    },
+    "brow_image_right": {
+      "node": "head",
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        },
+        {
+          "param": "ParamEyeLOpen",
+          "y": -2,
+          "at": 1
+        }
+      ]
+    },
+    "mouth_closed": {
+      "node": "head",
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        }
+      ],
+      "show": {
+        "param": "ParamMouthOpenY",
+        "from": 0.15,
+        "to": 0.02
+      }
+    },
+    "mouth_open": {
+      "node": "head",
+      "pivot": [
+        510,
+        227
+      ],
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.2
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.3
+        },
+        {
+          "param": "ParamMouthOpenY",
+          "sy": 0.7,
+          "at": 1
+        }
+      ],
+      "show": {
+        "param": "ParamMouthOpenY",
+        "from": 0.02,
+        "to": 0.15
+      }
+    },
+    "front_hair": {
+      "node": "head",
+      "pivot": [
+        505,
+        20
+      ],
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.35
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.25
+        },
+        {
+          "param": "ParamHairFront",
+          "rotate": 2.5
+        }
+      ]
+    },
+    "hair_clip": {
+      "node": "head",
+      "pivot": [
+        505,
+        20
+      ],
+      "drive": [
+        {
+          "param": "ParamAngleX",
+          "x": 0.35
+        },
+        {
+          "param": "ParamAngleY",
+          "y": -0.25
+        },
+        {
+          "param": "ParamHairFront",
+          "rotate": 2.5
+        }
+      ]
+    }
+  },
+  "idle": [
+    {
+      "param": "ParamBreath",
+      "mid": 0.5,
+      "size": 0.5,
+      "period": 3.6,
+      "phase": 0
+    },
+    {
+      "param": "ParamAngleX",
+      "size": 3,
+      "period": 6.3,
+      "phase": 0
+    },
+    {
+      "param": "ParamAngleY",
+      "size": 1.5,
+      "period": 4.7,
+      "phase": 1.3
+    },
+    {
+      "param": "ParamAngleZ",
+      "size": 2,
+      "period": 7.9,
+      "phase": 2.1
+    },
+    {
+      "param": "ParamBodyAngleX",
+      "size": 1.5,
+      "period": 8.6,
+      "phase": 0.7
+    },
+    {
+      "param": "ParamBodyAngleZ",
+      "size": 1,
+      "period": 9.7,
+      "phase": 3
+    },
+    {
+      "param": "ParamArmRA01",
+      "size": 1,
+      "period": 5.3,
+      "phase": 0.4
+    },
+    {
+      "param": "ParamArmLA01",
+      "size": 1,
+      "period": 5.9,
+      "phase": 2.2
+    },
+    {
+      "param": "ParamEyeBallX",
+      "size": 0.15,
+      "period": 11,
+      "phase": 1
+    }
+  ],
+  "physics": [
+    {
+      "param": "ParamHairFront",
+      "input": [
+        {
+          "param": "ParamAngleX",
+          "by": 0.5
+        },
+        {
+          "param": "ParamAngleZ",
+          "by": 1
+        },
+        {
+          "param": "ParamBodyAngleZ",
+          "by": 1
+        }
+      ],
+      "hz": 1.4,
+      "damping": 0.3,
+      "gain": 0.15
+    },
+    {
+      "param": "ParamHairBack",
+      "input": [
+        {
+          "param": "ParamAngleX",
+          "by": 0.5
+        },
+        {
+          "param": "ParamAngleZ",
+          "by": 1
+        },
+        {
+          "param": "ParamBodyAngleZ",
+          "by": 1
+        }
+      ],
+      "hz": 1.1,
+      "damping": 0.25,
+      "gain": 0.12
+    }
+  ],
+  "look": {
+    "at": [
+      508,
+      170
+    ],
+    "reach": 350,
+    "speed": 4,
+    "lanes": [
+      {
+        "param": "ParamAngleX",
+        "axis": "x",
+        "by": 20
+      },
+      {
+        "param": "ParamAngleY",
+        "axis": "y",
+        "by": -14
+      },
+      {
+        "param": "ParamEyeBallX",
+        "axis": "x",
+        "by": 1
+      },
+      {
+        "param": "ParamEyeBallY",
+        "axis": "y",
+        "by": -0.8
+      },
+      {
+        "param": "ParamBodyAngleX",
+        "axis": "x",
+        "by": 8
+      },
+      {
+        "param": "ParamBodyAngleZ",
+        "axis": "x",
+        "by": 6
+      }
+    ]
+  }
+}

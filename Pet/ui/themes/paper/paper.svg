@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180">
+  <!-- The grain on the dialogue's paper: warm noise at a few percent opacity, drawn over the
+       paper colour the page sets, so the settings' opacity still applies to the colour. It
+       tiles, so its edges are stitched. theme.json names this file as the paper texture. -->
+  <filter id="grain" x="0" y="0" width="100%" height="100%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="3" stitchTiles="stitch"/>
+    <feColorMatrix type="matrix" values="0 0 0 0 0.42  0 0 0 0 0.38  0 0 0 0 0.32  0 0 0 0.12 0"/>
+  </filter>
+  <rect width="100%" height="100%" filter="url(#grain)"/>
+</svg>

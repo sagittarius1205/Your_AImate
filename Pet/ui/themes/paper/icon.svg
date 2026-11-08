@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- The mark beside her name in the dialogue box. A four-point sparkle, drawn for this project.
+       theme.json names this file as the icon. -->
+  <path fill="#d97757" d="M12 1.5C12.7 7.6 16.4 11.3 22.5 12C16.4 12.7 12.7 16.4 12 22.5C11.3 16.4 7.6 12.7 1.5 12C7.6 11.3 11.3 7.6 12 1.5Z"/>
+</svg>

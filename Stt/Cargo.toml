@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["core", "host"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+# Dependencies run optimised in a debug build: SHA-256 over a 230 MB model and a sinc resampler are
+# minutes and not seconds at opt-level 0, and neither is code this repo debugs.
+[profile.dev.package."*"]
+opt-level = 3

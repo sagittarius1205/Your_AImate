@@ -1,0 +1,184 @@
+{
+  "canvas": [
+    1024,
+    1536
+  ],
+  "layers": [
+    {
+      "name": "back_hair",
+      "file": "back_hair.png",
+      "x": 284,
+      "y": 4,
+      "w": 457,
+      "h": 492
+    },
+    {
+      "name": "leg_image_left",
+      "file": "leg_image_left.png",
+      "x": 310,
+      "y": 862,
+      "w": 164,
+      "h": 669
+    },
+    {
+      "name": "leg_image_right",
+      "file": "leg_image_right.png",
+      "x": 544,
+      "y": 858,
+      "w": 162,
+      "h": 673
+    },
+    {
+      "name": "skirt",
+      "file": "skirt.png",
+      "x": 289,
+      "y": 567,
+      "w": 441,
+      "h": 316
+    },
+    {
+      "name": "torso",
+      "file": "torso.png",
+      "x": 371,
+      "y": 258,
+      "w": 282,
+      "h": 340
+    },
+    {
+      "name": "arm_image_left",
+      "file": "arm_image_left.png",
+      "x": 149,
+      "y": 321,
+      "w": 252,
+      "h": 517
+    },
+    {
+      "name": "arm_image_right",
+      "file": "arm_image_right.png",
+      "x": 623,
+      "y": 321,
+      "w": 250,
+      "h": 517
+    },
+    {
+      "name": "face",
+      "file": "face.png",
+      "x": 419,
+      "y": 65,
+      "w": 177,
+      "h": 212
+    },
+    {
+      "name": "eye_white_image_left",
+      "file": "eye_white_image_left.png",
+      "x": 448,
+      "y": 162,
+      "w": 38,
+      "h": 22
+    },
+    {
+      "name": "iris_image_left",
+      "file": "iris_image_left.png",
+      "x": 457,
+      "y": 150,
+      "w": 26,
+      "h": 36
+    },
+    {
+      "name": "eye_lash_image_left",
+      "file": "eye_lash_image_left.png",
+      "x": 437,
+      "y": 154,
+      "w": 50,
+      "h": 24
+    },
+    {
+      "name": "eye_white_image_right",
+      "file": "eye_white_image_right.png",
+      "x": 532,
+      "y": 160,
+      "w": 38,
+      "h": 23
+    },
+    {
+      "name": "iris_image_right",
+      "file": "iris_image_right.png",
+      "x": 536,
+      "y": 149,
+      "w": 26,
+      "h": 36
+    },
+    {
+      "name": "eye_lash_image_right",
+      "file": "eye_lash_image_right.png",
+      "x": 532,
+      "y": 152,
+      "w": 50,
+      "h": 30
+    },
+    {
+      "name": "eye_image_left_closed",
+      "file": "eye_image_left_closed.png",
+      "x": 433,
+      "y": 150,
+      "w": 58,
+      "h": 38
+    },
+    {
+      "name": "eye_image_right_closed",
+      "file": "eye_image_right_closed.png",
+      "x": 528,
+      "y": 148,
+      "w": 58,
+      "h": 39
+    },
+    {
+      "name": "brow_image_left",
+      "file": "brow_image_left.png",
+      "x": 453,
+      "y": 135,
+      "w": 34,
+      "h": 8
+    },
+    {
+      "name": "brow_image_right",
+      "file": "brow_image_right.png",
+      "x": 529,
+      "y": 134,
+      "w": 32,
+      "h": 9
+    },
+    {
+      "name": "mouth_closed",
+      "file": "mouth_closed.png",
+      "x": 496,
+      "y": 219,
+      "w": 32,
+      "h": 8
+    },
+    {
+      "name": "mouth_open",
+      "file": "mouth_open.png",
+      "x": 475,
+      "y": 201,
+      "w": 67,
+      "h": 47
+    },
+    {
+      "name": "front_hair",
+      "file": "front_hair.png",
+      "x": 350,
+      "y": 4,
+      "w": 310,
+      "h": 363
+    },
+    {
+      "name": "hair_clip",
+      "file": "hair_clip.png",
+      "x": 565,
+      "y": 56,
+      "w": 66,
+      "h": 69
+    }
+  ]
+}

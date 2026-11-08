@@ -1,0 +1,13 @@
+{
+  "name": "紙本",
+  "colors": {
+    "accent": "#d97757",
+    "paper": "#f3f2ef",
+    "ink": "#2b2b2b",
+    "border": "#cfc8bc",
+    "controls": "#f3f2ef"
+  },
+  "radius": 18,
+  "icon": "icon.svg",
+  "paper_texture": "paper.svg"
+}

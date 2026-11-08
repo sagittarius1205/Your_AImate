@@ -1,0 +1,9 @@
+* text=auto
+
+*.png binary
+*.wav binary
+*.ico binary
+
+# The pet binds its gestures to the figure by a hash of rig.json's bytes (Pet/src-tauri/src/cue/profile.rs),
+# so git has to hand those files back byte for byte on every checkout, whatever core.autocrlf says.
+Pet/ui/characters/**/*.json -text

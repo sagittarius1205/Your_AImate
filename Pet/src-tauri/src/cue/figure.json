@@ -1,0 +1,93 @@
+{
+  "model": "characters/char-20261107/rig.json",
+  "parameters": "fnv1a64:d2635ee0ff9fc169",
+  "bindings": {
+    "selfRef": { "state": "declaredAbsent" },
+    "offer": {
+      "state": "chosen",
+      "evidence": "authoredProfile",
+      "action": {
+        "do": "driveParams",
+        "lanes": [
+          { "id": "ParamArmRA01", "to": 18, "rise": 0.45, "hold": 0.2, "fall": 0.68 },
+          { "id": "ParamBodyAngleX", "to": -3, "rise": 0.45, "hold": 0.2, "fall": 0.75, "relative": true },
+          { "id": "ParamBodyAngleZ", "to": 1.5, "rise": 0.45, "hold": 0.2, "fall": 0.75, "relative": true }
+        ]
+      }
+    },
+    "open": {
+      "state": "chosen",
+      "evidence": "authoredProfile",
+      "action": {
+        "do": "driveParams",
+        "lanes": [
+          { "id": "ParamArmRA01", "to": 28, "rise": 0.45, "hold": 0.2, "fall": 0.68 },
+          { "id": "ParamArmLA01", "to": 28, "rise": 0.45, "hold": 0.2, "fall": 0.68 },
+          { "id": "ParamBodyAngleY", "to": 2.5, "rise": 0.45, "hold": 0.2, "fall": 0.75, "relative": true },
+          { "id": "ParamBodyAngleZ", "to": -1.5, "rise": 0.45, "hold": 0.2, "fall": 0.75, "relative": true }
+        ]
+      }
+    },
+    "question": {
+      "state": "chosen",
+      "evidence": "authoredProfile",
+      "action": {
+        "do": "driveParams",
+        "lanes": [
+          { "id": "ParamArmRA01", "to": 14, "rise": 0.45, "hold": 0.2, "fall": 0.68 },
+          { "id": "ParamArmLA01", "to": 14, "rise": 0.45, "hold": 0.2, "fall": 0.68 },
+          { "id": "ParamLeftShoulderUp", "to": 8, "rise": 0.45, "hold": 0.2, "fall": 0.68, "lag": 0.03 },
+          { "id": "ParamRightShoulderUp", "to": 8, "rise": 0.45, "hold": 0.2, "fall": 0.68, "lag": 0.03 },
+          { "id": "ParamAngleZ", "to": 7, "rise": 0.45, "hold": 0.1, "fall": 0.6, "lag": 0.1 },
+          { "id": "ParamBodyAngleX", "to": 1.5, "rise": 0.45, "hold": 0.2, "fall": 0.75, "relative": true },
+          { "id": "ParamBodyAngleZ", "to": 2.5, "rise": 0.45, "hold": 0.2, "fall": 0.75, "relative": true }
+        ]
+      }
+    },
+    "beat": {
+      "state": "chosen",
+      "evidence": "authoredProfile",
+      "action": {
+        "do": "driveParams",
+        "lanes": [
+          { "id": "ParamArmRA01", "to": 8, "rise": 0.3, "hold": 0.06, "fall": 0.45 }
+        ]
+      }
+    },
+    "beatBoth": {
+      "state": "chosen",
+      "evidence": "authoredProfile",
+      "action": {
+        "do": "driveParams",
+        "lanes": [
+          { "id": "ParamArmRA01", "to": 8, "rise": 0.3, "hold": 0.06, "fall": 0.45 },
+          { "id": "ParamArmLA01", "to": 8, "rise": 0.3, "hold": 0.06, "fall": 0.45 }
+        ]
+      }
+    },
+    "rest": { "state": "chosen", "evidence": "authoredProfile", "action": { "do": "nothing" } },
+    "nod": {
+      "state": "chosen",
+      "evidence": "authoredProfile",
+      "action": {
+        "do": "driveParams",
+        "lanes": [
+          { "id": "ParamAngleY", "to": -1.7143, "per": "degrees", "rise": 0.3, "hold": 0, "fall": 0.3 },
+          { "id": "ParamBodyAngleY", "to": -0.5714, "per": "degrees", "rise": 0.3, "hold": 0, "fall": 0.3, "lag": 0.06 }
+        ]
+      }
+    },
+    "lookAway": {
+      "state": "chosen",
+      "evidence": "authoredProfile",
+      "action": {
+        "do": "driveParams",
+        "lanes": [
+          { "id": "ParamAngleX", "to": 0.6, "per": "yaw", "rise": 0.35, "hold": 0, "fall": 0.35, "lag": 0.2 },
+          { "id": "ParamEyeBallX", "to": 0.0533, "per": "yaw", "rise": 0.15, "hold": 0, "fall": 0.15 },
+          { "id": "ParamAngleY", "to": 0.6, "per": "pitch", "rise": 0.35, "hold": 0, "fall": 0.35, "lag": 0.2 }
+        ]
+      }
+    }
+  }
+}

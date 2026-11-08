@@ -1,0 +1,1653 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<title>VRPet Spike</title>
+<style>
+  /* What the settings window controls, set by `applySettings` below from what Rust sends. These are
+     the design's defaults (Docs/DESIGN_Settings.md 1), which hold until Rust has answered.
+     `--ui` scales the dialogue's text and the buttons and nothing else. `--figure` scales her and
+     nothing else, inside the window (`#char`). The whole window's size is the webview's zoom, which
+     Rust sets (main.rs `fit_window`). */
+  :root {
+    --ui: 1;
+    --figure: 1;
+    --say-size: 13px;
+    --bubble-opacity: 0.92;
+
+    /* The interface theme (Docs/DESIGN_Themes.md), set by `applyTheme` below from what Rust lists.
+       A theme is five colours, a radius and two pictures; these are the bundled 紙本, which holds
+       until Rust answers. Every colour on the dialogue is one of the five or mixed from them here,
+       so a theme recolours the whole of it and cannot reach anything else. */
+    --accent: #d97757;
+    --paper: #f3f2ef;
+    --ink: #2b2b2b;
+    --border: #cfc8bc;
+    --controls: #f3f2ef;
+    --radius: 18px;
+    --icon: url("themes/paper/icon.svg");
+    --paper-texture: url("themes/paper/paper.svg");
+
+    /* Mixed from the five: her name is the accent toward the ink, so it reads on a light paper and a
+       dark one alike; the faint marks are the ink toward the paper. */
+    --name: color-mix(in srgb, var(--accent) 60%, var(--ink));
+    --faint: color-mix(in srgb, var(--ink) 40%, var(--paper));
+    --scroll: color-mix(in srgb, var(--ink) 30%, transparent);
+    --paper-seen: color-mix(in srgb, var(--paper) calc(var(--bubble-opacity) * 100%), transparent);
+  }
+  /* A theme without an icon leaves no gap where it would be. */
+  :root.no-icon .chat-icon { display: none; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    color: #e8eaed;
+    user-select: none;
+    cursor: default;
+  }
+
+  /* The fleet list lives behind one button (Docs/DESIGN_Pet.md 4.4.5), which sits at the left end
+     of the strip above the dialogue box, opposite the settings, quit and dialogue buttons
+     (Docs/DESIGN_Pet.md 4.4.6).
+
+     The button carries the count itself, and that is the load-bearing part, not the button. Gate
+     condition 2 measures whether the gatekeeper shortens the time a waiting session waits, and a
+     list you have to open shortens nothing unless something tells you to open it. D2 already paid
+     for that lesson once: a read-only list was judged not enough, which is where "take me there"
+     came from. So this is the hint the layout's ruling asked for, and it is the whole reason the
+     list is allowed to be collapsed. */
+  #gate {
+    position: absolute;
+    left: 10px;
+    bottom: 194px;
+    height: calc(22px * var(--ui));
+    padding: 0 9px;
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) * 2);
+    background: var(--controls);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.16);
+    color: color-mix(in srgb, var(--ink) 70%, var(--controls));
+    font: inherit;
+    font-size: calc(11px * var(--ui));
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  #gate .n { margin-right: 4px; font-weight: 700; }
+  /* Something is waiting. Same colour as the row's own chip, so the collapsed button and the open
+     list say it the same way. */
+  #gate.wait {
+    border-color: #c2410c;
+    background: #c2410c;
+    color: #fff;
+    font-weight: 600;
+  }
+  #gate.open { border-color: var(--accent); }
+
+  /* Open, the list covers the character. That is allowed for the reason the log is allowed to
+     (Docs/DESIGN_Pet.md 4.4.1): it is a press away from being closed. Shut, it is not drawn at
+     all, so it reports no rectangle and the whole window is click-through again. It opens upward
+     from its button and stops where the history sheet does, above the strip of buttons, so neither
+     one can cover a button that closes it.
+
+     `z-index` because this is the only element that is meant to overlap the character, and it sits
+     before `#char` in the document, so without it the figure paints over the list. Found by looking
+     at it: every rectangle was right and the session names were behind an arm, which is a thing no
+     amount of rectangle arithmetic could have said. Nothing else here sets a z-index, and
+     `pet_page` fails if the character ever does, because that would put the figure back on top. */
+  #panel {
+    position: absolute;
+    z-index: 2;
+    left: 10px;
+    right: 10px;
+    bottom: 228px;
+    max-height: 300px;
+    overflow-y: auto;
+    padding: 10px 12px;
+    background: rgba(18, 20, 24, 0.92);
+    border-radius: 10px;
+    font-size: 12px;
+    line-height: 1.45;
+    box-sizing: border-box;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+  }
+  #panel.shut { display: none; }
+
+  #panel h1 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: #9fb4ff;
+  }
+
+  .diag { color: #8a9099; font-size: 11px; margin-bottom: 6px; }
+  .diag b { color: #e8eaed; font-weight: 600; }
+  .err { color: #ff8f8f; }
+
+  #rows { display: grid; gap: 3px; max-height: 300px; overflow: hidden; }
+
+  .row { display: flex; gap: 8px; align-items: baseline; }
+  /* The name and what the session is asking stack, so the status chip and the age keep their
+     places on the first line however long the message is. min-width: 0 is what lets the name's
+     ellipsis work inside a flex child. */
+  .row .mid { flex: 1 1 auto; min-width: 0; }
+  .row .st {
+    flex: 0 0 auto;
+    min-width: 54px;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.1);
+    font-size: 10px;
+    text-align: center;
+  }
+  .row .nm { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* What the session is asking. Clamped to two lines in CSS as well as capped in Rust: the Rust
+     cap counts characters, and characters are not pixels. */
+  .row .ask {
+    color: #ffb366;
+    font-size: 10px;
+    line-height: 1.35;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  .row .ag { flex: 0 0 auto; color: #8a9099; font-size: 11px; }
+  .row.here .nm { color: #9fb4ff; }
+
+  /* A session stopped at a permission prompt. The only row the user has to act on. */
+  .row.wait .st { background: #c2410c; color: #fff; font-weight: 600; }
+  .row.wait .nm { color: #ffd9a8; font-weight: 600; }
+  b.wait { color: #ffb366; }
+
+  /* The character. Its rect is reported to Rust, which toggles click-through from outside the
+     window, because a window that ignores the cursor never sees the cursor.
+
+     76 and not 46, because the dialogue box covers her from the knees down now (Docs/DESIGN_Pet.md
+     4.4.6), and at 46 her boots ended at y 566.8, below the box's bottom edge at 564, so a sliver of
+     boot showed in the gap between the box and the text field. 30 up puts her feet at 536.8, inside
+     the box, and her top at 250.4, which is still clear of the choices' band. Both numbers are the
+     24-frame sampling of Docs/DESIGN_Pet.md 4.4.1 moved by the 30, not a new measurement.
+
+     `--figure` sizes the box about its bottom edge and the window's middle, and `character.js` fits
+     her into the box in proportion to it, so every point of her moves toward or away from y 544,
+     the box's bottom, 7.2 under her soles. Her feet stay in the dialogue box at every size the
+     settings allow, her top is at 544 - 293.6 x `--figure`, and the click region, which is this box,
+     and the point she looks from, which `character.js` reads off the canvas, follow without being
+     told. */
+  #char {
+    position: absolute;
+    left: calc(230px - 160px * var(--figure));
+    bottom: 76px;
+    width: calc(320px * var(--figure));
+    height: calc(320px * var(--figure));
+    cursor: grab;
+  }
+  #char canvas { width: 100%; height: 100%; display: block; }
+  #char.outline { outline: 1px dashed rgba(159, 180, 255, 0.5); }
+
+  /* A visual novel's layout (使用者 2026-11-08, Docs/DESIGN_Pet.md 4.4.6), on a 460x620 window and
+     from the bottom up: the text field as a pill along the bottom edge, the dialogue box over her
+     legs, a strip of buttons above the box, her, and the choices in the band above her head. The
+     history and the fleet list are sheets that open over her and stop above the strip.
+
+     Every box is anchored by its bottom and has a fixed height, so the sum that places the next one
+     up is the same at every `--ui`: the scale makes the text and the buttons larger inside their
+     boxes and moves no box. `pet_page` does that arithmetic on the numbers here. */
+
+  /* The band above her head. 8 to 244, because her topmost opaque point is 250.4 now, so three
+     cards with her answer still leave her face uncovered, which the reference picture does too: its
+     choices float in the upper part of the scene, apart from the box. The cards sit at the band's
+     bottom, next to her, and a fourth or a long label scrolls the band.
+
+     `margin-top: auto` on the first card is what bottom-aligns them. Setting `justify-content` to
+     `flex-end` looks like the way to bottom-align a scrolling column and is a trap, since the
+     overflow then leaves through the TOP of the box, where no scroll reaches. The guard in pet_page
+     matches the declaration, colon and all, so this sentence can still name the two. Measured when
+     the cards were in an earlier band: a fourth card laid out at y 122 against a container starting
+     at 155, scrollHeight equal to clientHeight, and scrollTop stuck at 0. The card was invisible,
+     still had a rectangle, and so became a button over the fleet panel.
+
+     The band's bottom follows her head as `--figure` moves it, 6.4 above it at every size: 148 tall
+     at 1.3, which is three one-line cards at the largest text, and 309 at 0.75, so the cards stay
+     next to her instead of floating far above a small figure. */
+  #chatChoices {
+    position: absolute;
+    left: 40px;
+    right: 40px;
+    top: 8px;
+    height: calc(236px - 293.6px * (var(--figure) - 1));
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--scroll) transparent;
+  }
+  #chatChoices > :first-child { margin-top: auto; }
+
+  /* The dialogue box, 432 to 564. Its height is fixed, as in the games this copies: a long answer
+     scrolls inside it and a short one leaves paper below it, so the box never jumps as she talks. */
+  #chatBubble {
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: 56px;
+    height: 132px;
+  }
+
+  /* The text field, 572 to 612, 8 under the box, so the box can never cover the microphone. */
+  #chatInput {
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: 8px;
+    height: 40px;
+  }
+
+  /* The history, opened from the box's "›". It covers her and the choices while it is open, which
+     is allowed for the reason the fleet list is: the same "›" closes it, and that is in the box,
+     below the sheet, where the sheet cannot cover it. It stops at 392, above the strip of buttons
+     at every `--ui`. */
+  #chatLog {
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: 228px;
+  }
+
+  /* The paper. One colour for every surface she speaks on, the theme's, with the opacity the
+     settings give the dialogue and the theme's texture over it. */
+  .chat-box {
+    position: relative;
+    height: 100%;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    padding: 10px 16px 10px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--paper-seen);
+    background-image: var(--paper-texture);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+    color: var(--ink);
+  }
+  .chat-head {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+  }
+  .chat-icon {
+    flex: none;
+    width: calc(16px * var(--ui));
+    height: calc(16px * var(--ui));
+    background: var(--icon) center / contain no-repeat;
+  }
+  .chat-name {
+    color: var(--name);
+    font-size: calc(12px * var(--ui));
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+  .chat-say {
+    overflow-wrap: anywhere;
+    /* The core's answers are the model's prose, and prose has line breaks in it. Without this they
+       collapse into spaces and a list reads as one paragraph, while the text in the DOM looks
+       right, which is a confusing way to find out. */
+    white-space: pre-wrap;
+    font-size: calc(var(--say-size) * var(--ui));
+    line-height: 1.6;
+  }
+  /* The column on the right is the "›"'s. A margin and not a padding, because the scrollbar is
+     drawn inside the padding, and at the largest text it ran down over the "›". */
+  .chat-box .chat-say {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    margin-right: calc(20px * var(--ui));
+    padding-right: 4px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--scroll) transparent;
+  }
+  /* The "›". Dark and moving when the next page of her answer has come in and is waiting, which is
+     the one time it asks to be pressed. Pale otherwise, when it only opens the history, and turned
+     down while the history is open, to say it closes it. */
+  .chat-next {
+    position: absolute;
+    right: 8px;
+    bottom: 4px;
+    width: calc(26px * var(--ui));
+    height: calc(26px * var(--ui));
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--faint);
+    font: inherit;
+    font-size: calc(24px * var(--ui));
+    line-height: 1;
+    cursor: pointer;
+  }
+  .chat-next:hover { color: var(--ink); }
+  .chat-next.waiting { color: var(--ink); animation: chat-nudge 1.1s ease-in-out infinite; }
+  .chat-next.open { transform: rotate(90deg); }
+  @keyframes chat-nudge {
+    0%, 100% { transform: translateX(0); }
+    50% { transform: translateX(3px); }
+  }
+
+  .chat-choice {
+    flex: none;
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 6px;
+    padding: 7px 14px;
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) * 0.55);
+    background-color: var(--paper-seen);
+    background-image: var(--paper-texture);
+    box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16);
+    color: var(--ink);
+    font: inherit;
+    font-size: calc(12px * var(--ui));
+    line-height: 1.45;
+    text-align: center;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+  }
+  .chat-choice:hover {
+    border-color: var(--accent);
+    background-color: color-mix(in srgb, color-mix(in srgb, var(--accent) 12%, var(--paper)) calc(var(--bubble-opacity) * 100%), transparent);
+  }
+
+  .chat-log {
+    max-height: 384px;
+    overflow-y: auto;
+    box-sizing: border-box;
+    padding: 12px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--paper-seen);
+    background-image: var(--paper-texture);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+    color: var(--ink);
+    scrollbar-width: thin;
+    scrollbar-color: var(--scroll) transparent;
+  }
+  .chat-turn { margin-bottom: 10px; }
+  .chat-turn:last-child { margin-bottom: 0; }
+  .chat-who { color: var(--name); font-size: calc(11px * var(--ui)); font-weight: 700; letter-spacing: 0.04em; }
+  .chat-turn.user .chat-who { color: color-mix(in srgb, var(--ink) 50%, var(--paper)); }
+  .chat-turn.user .chat-say { color: color-mix(in srgb, var(--ink) 75%, var(--paper)); }
+
+  /* The pill. The microphone lives inside it on the right, so it is one of the row's children and
+     shares the row's rectangle. There is no send button: Enter sends, as in the reference, and the
+     reference's "+" is left out because the pet takes no attachments, and a button that does
+     nothing is worse than none. */
+  .chat-input {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 100%;
+    box-sizing: border-box;
+    padding: 0 5px 0 18px;
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) * 2);
+    background-color: color-mix(in srgb, var(--controls) calc(var(--bubble-opacity) * 100%), transparent);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+  }
+  .chat-input:focus-within { border-color: var(--accent); }
+  .chat-field {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    outline: none;
+    background: transparent;
+    color: var(--ink);
+    font: inherit;
+    font-size: calc(13px * var(--ui));
+  }
+  .chat-field::placeholder { color: var(--faint); }
+  /* The microphone. Held, not clicked: down opens the microphone and up sends what was said
+     (Docs/DESIGN_STT.md 4.1.1). Idle it is a round button with a waveform on it, and every other
+     state is said in words beside the waveform, because a button that records must never look idle
+     while it is listening. `touch-action` so a pen or a finger held on it is a press and not a
+     scroll. */
+  .chat-mic {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-width: 30px;
+    height: 30px;
+    box-sizing: border-box;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--ink) 6%, var(--controls));
+    color: color-mix(in srgb, var(--ink) 90%, var(--controls));
+    font: inherit;
+    font-size: calc(12px * var(--ui));
+    white-space: nowrap;
+    cursor: pointer;
+    touch-action: none;
+  }
+  .chat-mic:hover { background: color-mix(in srgb, var(--ink) 11%, var(--controls)); }
+  .chat-mic.listening { background: #c2410c; color: #fff; font-weight: 600; }
+  .chat-mic.recognising { background: #f6e3da; color: #c2410c; }
+  .chat-mic.unavailable { color: var(--faint); cursor: not-allowed; }
+  .chat-mic-label:empty { display: none; }
+  .chat-wave { display: inline-flex; align-items: center; gap: 2px; height: 14px; }
+  .chat-wave span { width: 2px; border-radius: 1px; background: currentColor; }
+  .chat-wave span:nth-child(1), .chat-wave span:nth-child(5) { height: 5px; }
+  .chat-wave span:nth-child(2), .chat-wave span:nth-child(4) { height: 10px; }
+  .chat-wave span:nth-child(3) { height: 14px; }
+  .chat-mic.listening .chat-wave span { animation: chat-wave 0.7s ease-in-out infinite alternate; }
+  .chat-mic.listening .chat-wave span:nth-child(2n) { animation-delay: 0.35s; }
+  @keyframes chat-wave {
+    from { transform: scaleY(0.5); }
+    to { transform: scaleY(1); }
+  }
+
+  /* The controls that outlive a closed box: settings, quit and the dialogue's toggle, at the right
+     end of the strip between the box and her, with the fleet list's button at the left end. The
+     strip's bottom is 426 and the box's top is 432, and the buttons grow upward from there with
+     `--ui`, so they never reach the box, and they stay where they were when the box is closed. One
+     row and not three fixed offsets, because `--ui` makes the buttons wider and the quit button
+     grows when it asks, and a fixed offset would lay one over the next. */
+  #controls {
+    position: absolute;
+    right: 10px;
+    bottom: 194px;
+    display: flex;
+    gap: 6px;
+  }
+  #controls button {
+    height: calc(22px * var(--ui));
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) * 2);
+    background: var(--controls);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.16);
+    color: color-mix(in srgb, var(--ink) 85%, var(--controls));
+    font: inherit;
+    font-size: calc(11px * var(--ui));
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  #controls button:hover { border-color: var(--accent); }
+  #chatToggle.on { color: color-mix(in srgb, var(--accent) 80%, var(--ink)); }
+  /* The window has no title bar, no taskbar entry and no tray icon, so this is the only way to end
+     the pet short of Task Manager. */
+  #quit.armed { border-color: #c2410c; background: #c2410c; color: #fff; }
+</style>
+</head>
+<body>
+
+<div id="panel" class="shut">
+  <h1>VRPet spike</h1>
+  <div class="diag" id="diag">starting</div>
+  <div id="rows"></div>
+</div>
+
+<!-- Everything after the character paints over it without a z-index, which `pet_page` keeps the
+     figure from claiming. The fleet list's button is here and not before it, because a wide count
+     reaches into the character's box, and there the canvas would take the click. -->
+<div id="char" class="outline"><canvas id="gl"></canvas></div>
+<div id="chatChoices"></div>
+<div id="chatBubble"></div>
+<div id="chatInput"></div>
+<div id="chatLog"></div>
+<button id="gate" type="button" title="在等你的 session"><span class="n" id="gateN">0</span>在等</button>
+<div id="controls">
+  <button id="settingsToggle" type="button" title="設定">設定</button>
+  <button id="quit" type="button" title="結束桌寵">結束</button>
+  <button id="chatToggle" type="button" title="開關對話框">對話</button>
+</div>
+
+<!--
+  No third-party runtime. `character.js` draws the figure itself from the layers in
+  `characters/` (Docs/DESIGN_Pet.md 3.4), and both files are in git, so all they have to do is
+  load before the inline script below.
+-->
+<script src="character.js"></script>
+<script src="chat.js"></script>
+
+<script>
+const invoke = window.__TAURI__.core.invoke;
+const appWindow = window.__TAURI__.window.getCurrentWindow();
+
+// Everything the page complains about, kept.
+//
+// A window with no devtools throws `console.warn` on the floor. The first run of the Live2D
+// model was silent in exactly this way: it loaded, drew nothing, moved nothing, and reported no
+// error at all. A warning we could not read would have said why.
+const logged = [];
+function keep(text) {
+  if (logged.length < 40) logged.push(text);
+}
+for (const level of ["warn", "error"]) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    keep(level + ": " + args.map(String).join(" "));
+    original(...args);
+  };
+}
+
+// An exception thrown inside an animation frame never reaches `console.error`. When the old
+// renderer's ticker met one on its first frame it stopped every animation on the page for good,
+// with nothing printed and nothing to catch. That is a silence worth a listener of its own, and the
+// stack is the whole value of it.
+window.addEventListener("error", (e) => {
+  const stack = e.error && e.error.stack ? String(e.error.stack).split("\n").slice(0, 6).join(" | ") : "";
+  keep("uncaught: " + String(e.message) + (stack ? " @ " + stack : ""));
+});
+window.addEventListener("unhandledrejection", (e) => {
+  keep("unhandled rejection: " + String((e.reason && e.reason.stack) || e.reason));
+});
+
+const charEl = document.getElementById("char");
+const chatEls = {
+  bubble: document.getElementById("chatBubble"),
+  choices: document.getElementById("chatChoices"),
+  input: document.getElementById("chatInput"),
+  log: document.getElementById("chatLog"),
+};
+const toggleEl = document.getElementById("chatToggle");
+const diagEl = document.getElementById("diag");
+const rowsEl = document.getElementById("rows");
+const panelEl = document.getElementById("panel");
+const gateEl = document.getElementById("gate");
+const gateNEl = document.getElementById("gateN");
+
+// ---------------------------------------------------------------- the dialogue
+
+// `chat.js` draws a turn and does not know what anyone says. What the character says comes from the
+// conversation core, a process Rust starts (src-tauri/src/core.rs), and it reaches this page only as
+// the events handled under "the core" below.
+//
+// The first line in the bubble is the character's own greeting, from her `character.json`, and this
+// is the line for a character whose profile has none. Neither is asked of the model. Her greeting is
+// put in the bubble the moment the page has it and is voiced a moment later, when the core has
+// synthesised it (`greet` under "the core" below); the text does not wait for the voice, so a core
+// that is slow or down still leaves her saying something.
+//
+// This line is never voiced: it is the page's and not hers, and no voice is the right one for it. It
+// stays for a profile with no greeting because without a first turn the box opens as a lone text
+// field, with nothing to say that she is the one listening. It is written to suit any character.
+const OPENING = "我在呢，有什麼事就跟我說。";
+
+// The microphone button. Built here and handed to the dialogue's text row, so it lies inside the
+// row's rectangle and the hit test covers it with no rectangle of its own (`pet_mic`). Its wiring is
+// under "the microphone" below, after the character, for the reason the core's is.
+//
+// A waveform of five bars and a label. The label is empty while the button is idle or unavailable,
+// where the waveform and the button's title say enough, and names every other state.
+const micEl = document.createElement("button");
+micEl.type = "button";
+micEl.className = "chat-mic unavailable";
+const micWave = document.createElement("span");
+micWave.className = "chat-wave";
+for (let i = 0; i < 5; i++) micWave.append(document.createElement("span"));
+const micLabel = document.createElement("span");
+micLabel.className = "chat-mic-label";
+micEl.append(micWave, micLabel);
+// Her name is not known yet: it comes with the roster below, which renames her in the log and
+// opens with her greeting.
+Chat.mount(chatEls, {}, [micEl]);
+// A typed sentence and a pressed card arrive here the same way. The answer is not awaited: it comes
+// back as an event, so the only thing this call can fail at is handing the sentence over.
+// The one player. Two kinds of clip sound through it, and both are the shape the core and the filler
+// bank share: `samples`, `pcm_b64` (16 kHz mono PCM16) and `envelope`.
+//
+// The thinking filler. The character has to make a sound the moment the user stops typing: the
+// core's own turn is a measured 3 to 10 seconds and synthesising its reply is a few more
+// (Docs/DESIGN_ChatCore.md section 11), and a character that sits in silence that long reads as
+// broken rather than as thinking. The audio is pre-rendered in the product voice and compiled into
+// the binary (src-tauri/src/voice), so this costs no engine time and cannot fail on a missing file.
+//
+// The answer. The core synthesises it in the same voice and sends it on the `utterance` event, in
+// parts: the first as soon as it is synthesised and the rest while it plays, each as an `utterance`
+// of its own with a `part` number (src-tauri/src/core.rs). The parts of one answer are one turn.
+//
+// One player and not two, so there is one mouth source and one rule: a new turn stops whatever is
+// sounding. Web Audio and not an `<audio>` element, because the mouth is driven from an envelope
+// indexed by the sample clock.
+const Speaker = (function () {
+  let ctx = null;
+  // The turn that is sounding: the parts of one answer in the order they were scheduled, each with
+  // its source, the loudness envelope that came with it, the gestures planned for it, and the
+  // AudioContext times at which it starts and ends; `startedAt` is the first part's start and `end`
+  // the last one's end, and `merged` is the parts' gestures on the turn's clock, built when asked
+  // for and dropped when a part is added. One object and not parallel variables, so there is no moment
+  // when a source is paired with another part's envelope or gestures. Null when nothing is sounding
+  // and nothing is scheduled.
+  let playing = null;
+  // Every play and every stop takes a newer ticket, and a clip starts only if its ticket is still
+  // the newest when it is ready. A filler is fetched from Rust first, and one that comes back after
+  // the answer has started must not cut the answer off.
+  let ticket = 0;
+  // The ticket of the answer whose later parts are still welcome, or null before there has been
+  // one. Only `speak` sets it, and the next filler, stop or speak takes a newer ticket, which closes
+  // it. A later part therefore joins the turn its first part began, whether that turn is still
+  // sounding or has gone quiet while the next part was being made, and never joins one that
+  // something else has stopped or replaced. Not 0, which is the ticket before anything has played:
+  // a part with no first part before it would be taken for an answer's.
+  let answer = null;
+  // What the settings say (`configure`): how loud, and whether her answers and the thinking fillers
+  // sound at all. One gain for both kinds of clip, because the design gives them one volume.
+  let gain = null;
+  let volume = 0.8;
+  let voiced = true;
+  let fillers = true;
+
+  // The envelope is one loudness value per FRAME_SAMPLES samples at SAMPLE_RATE. Rust holds the same
+  // pair as `voice::FRAME_SAMPLES` and `voice::SAMPLE_RATE` (src-tauri/src/voice/mod.rs), and
+  // `pet_mouth` fails when the two sides stop agreeing. The frame length is derived from the pair
+  // and not written down as a number, because a bare 0.02 here would be a fact about a file in
+  // another language with nothing tying it to that file.
+  const SAMPLE_RATE = 16000;
+  const FRAME_SAMPLES = 320;
+  const FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE;
+
+  function context() {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return ctx;
+  }
+
+  function output() {
+    if (!gain) {
+      gain = context().createGain();
+      gain.gain.value = volume;
+      gain.connect(context().destination);
+    }
+    return gain;
+  }
+
+  // 16 kHz mono PCM16, little-endian, as `voice/fillers.json` and the core's `voice` hold it.
+  // Decoded here rather than in Rust so that nothing in this app encodes or decodes base64 twice.
+  function buffer(f) {
+    const raw = atob(f.pcm_b64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const view = new DataView(bytes.buffer);
+    const buf = context().createBuffer(1, f.samples, SAMPLE_RATE);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < f.samples; i++) ch[i] = view.getInt16(i * 2, true) / 32768;
+    return buf;
+  }
+
+  // Plays `f` if `mine` is still the newest ticket once the context is running. True if it started.
+  // `actions` is the plan Rust made for this clip, or null for a clip with none (a filler).
+  //
+  // A clip that `joins` goes after the last part of the turn that is sounding, at the very sample
+  // where that part ends, so a part that arrives in time leaves no gap. If the turn has gone quiet
+  // while the part was being made, the part starts at once. Any other clip is a turn of its own, and
+  // stops the one before it.
+  //
+  // `onStart` runs at the moment the clip begins to sound, and not at all if its turn is stopped or
+  // replaced first: the box turns to a page when her voice gets there, not when the part arrives.
+  async function start(f, mine, actions, joins, onStart) {
+    // A context created before any gesture starts suspended. The filler runs from a click or a
+    // keypress, where resuming is allowed; WebView2 here starts the context without one (measured).
+    if (context().state === "suspended") await context().resume();
+    if (mine !== ticket) return false;
+    // The source first, because a clip that cannot be decoded must leave what is sounding alone.
+    const src = context().createBufferSource();
+    src.buffer = buffer(f);
+    src.connect(output());
+    const now = context().currentTime;
+    // The clock decides whether the turn is still going and not `onended`, which fires some time
+    // after the sound has ended.
+    if (!(joins && playing && now < playing.end)) {
+      silence();
+      playing = { parts: [], startedAt: now, end: now, merged: null };
+    }
+    const turn = playing;
+    const at = Math.max(now, turn.end);
+    const part = { src, envelope: f.envelope, actions, at, end: at + src.buffer.duration };
+    // The turn is over when its last part is, so a part that ends with another scheduled after it
+    // clears nothing, and one that ends late cannot take a newer turn's place away.
+    src.onended = () => { if (playing === turn && turn.parts[turn.parts.length - 1] === part) playing = null; };
+    src.start(at);
+    turn.parts.push(part);
+    turn.end = part.end;
+    turn.merged = null;
+    if (onStart) {
+      setTimeout(() => {
+        if (playing === turn) onStart();
+      }, Math.max(0, (at - context().currentTime) * 1000));
+    }
+    return true;
+  }
+
+  async function filler() {
+    const mine = ++ticket;
+    // Switched off, the filler still stands for the user's turn and ends what was sounding, as one
+    // that played would have.
+    if (!fillers) {
+      silence();
+      return null;
+    }
+    const f = await invoke("filler");
+    if (!f || mine !== ticket) return null;
+    return (await start(f, mine, null)) ? f : null;
+  }
+
+  function actionsOf(plan) {
+    return plan && Array.isArray(plan.actions) ? plan.actions : null;
+  }
+
+  // The core's `voice` when its state is "voiced", and the `plan` Rust added beside it. This starts
+  // a turn, and is the only thing that opens one to later parts.
+  function speak(voice, plan) {
+    const mine = ++ticket;
+    answer = mine;
+    // Muted in the settings: her words are in the bubble already, and nothing plays, so the mouth
+    // and the gestures, which follow the sound, stay still too.
+    if (!voiced) return Promise.resolve(false);
+    return start(voice, mine, actionsOf(plan));
+  }
+
+  // A later part of the answer `speak` began. It takes no ticket of its own: it is wanted only
+  // while nothing has taken one since `speak` did, and it is checked again once the context is
+  // running, so a part still on its way when something stops or replaces the turn never sounds.
+  // False when it was not played.
+  function queue(voice, plan, onStart) {
+    if (answer !== ticket) return Promise.resolve(false);
+    if (!voiced) return Promise.resolve(false);
+    return start(voice, ticket, actionsOf(plan), true, onStart);
+  }
+
+  // The settings' share of the player. Switching her voice off stops an answer that is talking.
+  function configure(s) {
+    volume = s.volume;
+    if (gain) gain.gain.value = volume;
+    if (voiced && !s.voice) stop();
+    voiced = s.voice;
+    fillers = s.fillers;
+  }
+
+  function silence() {
+    if (!playing) return;
+    // Every part, the ones that have not started as well: a source that was scheduled and is
+    // stopped before its time never sounds.
+    playing.parts.forEach((part) => {
+      try {
+        part.src.stop();
+      } catch (e) {
+        // Already ended. `stop` on a finished source throws in some engines and is a no-op here.
+      }
+    });
+    playing = null;
+  }
+
+  // Called when an answer arrives, voiced or not. A filler is at most 1.92 s and the core takes
+  // seconds, so they rarely meet, but a refused turn can come back at once, and two voices at the
+  // same time is the kind of fault that gets reported as "it sometimes talks over itself". The new
+  // ticket also stops a filler that is still being fetched from starting after this, and closes the
+  // answer to later parts.
+  function stop() {
+    ticket++;
+    silence();
+  }
+
+  // How far the mouth should open right now, 0..1, or null when nothing is sounding. This is what
+  // `Character.mouth` is given.
+  //
+  // The position comes from the audio clock and not from a timer. A timer started beside `start()`
+  // runs late by however late the page ran it, while the audio clock is the one the speakers follow.
+  // The envelope is 50 Hz and the render is about 75 fps (measured), so reading the nearest frame
+  // would step the mouth. The value is interpolated linearly between the two frames either side of
+  // the position instead.
+  //
+  // The last frame has no frame after it and holds. Past the end of the envelope the answer is null,
+  // which gives the mouth back to the idle motion.
+  //
+  // The envelope is the one of the part sounding at this instant, which is the last part that has
+  // started. Between two parts that is the earlier one, past the end of its envelope, so a turn that
+  // went quiet waiting for its next part has a closed mouth.
+  function level() {
+    if (!playing) return null;
+    // A suspended context stops its clock and its speakers together, and `onended` cannot fire
+    // while it is stopped. Without this the position would freeze and the mouth would hold open,
+    // silently, until the next clip. Whether this window ever suspends mid-clip is not measured;
+    // what is certain is that the mouth must not be open when nothing is coming out.
+    if (ctx.state !== "running") return null;
+    const part = sounding(ctx.currentTime);
+    if (!part) return null;
+    const envelope = part.envelope;
+    const at = (ctx.currentTime - part.at) / FRAME_SECONDS;
+    const i = Math.floor(at);
+    if (!(i >= 0 && i < envelope.length)) return null;
+    const next = i + 1 < envelope.length ? envelope[i + 1] : envelope[i];
+    return envelope[i] + (next - envelope[i]) * (at - i);
+  }
+
+  function sounding(now) {
+    for (let k = playing.parts.length - 1; k >= 0; k--) {
+      if (playing.parts[k].at <= now) return playing.parts[k];
+    }
+    return null;
+  }
+
+  // Every part's gestures on the turn's clock. A plan counts from its own part's first sample, so
+  // each action's `at` moves by how long after the turn began the part started, and the turn plays
+  // as one timeline that `character.js` needs to know nothing about. The same array comes back until
+  // a part is added, because `character.js` keeps the lanes it worked out for an array and would
+  // redo them every frame for a new one. A turn of one part hands over the plan itself.
+  function allActions(turn) {
+    if (!turn.merged) {
+      turn.merged =
+        turn.parts.length === 1
+          ? turn.parts[0].actions
+          : turn.parts.flatMap((part) =>
+              (part.actions || []).map((a) => Object.assign({}, a, { at: a.at + (part.at - turn.startedAt) })),
+            );
+    }
+    return turn.merged;
+  }
+
+  // Where the sounding answer has got to, for the gestures: its plan, the seconds since it started,
+  // on the clock `level` reads, and how long it is, or null when nothing with a plan is sounding. For
+  // a turn in parts that is every part's plan, the seconds since the first part started, and the
+  // end of the last part scheduled so far. A new turn replaces `playing`, so the old plan goes with
+  // the old sound and cannot play over the new one.
+  function timeline() {
+    if (!playing || !playing.parts.some((part) => part.actions)) return null;
+    if (ctx.state !== "running") return null;
+    return { actions: allActions(playing), at: ctx.currentTime - playing.startedAt, length: playing.end - playing.startedAt };
+  }
+
+  // `volume` is what the gain is set to, or will be once there is a context, for a probe outside
+  // the page.
+  return { filler, speak, queue, stop, level, timeline, configure, state: () => (ctx ? ctx.state : "none"), playing: () => playing !== null, volume: () => (gain ? gain.gain.value : volume) };
+})();
+
+Chat.onChoose((text) => {
+  invoke("say", { text }).catch((e) => trouble("這句話沒送到核心：" + String(e)));
+  // Separate and not chained: a filler that fails must never stop the sentence being sent, and a
+  // sentence that fails to send still deserves the sound, because the user's own action happened.
+  Speaker.filler().catch((e) => console.error("filler: " + String(e)));
+});
+
+// A closed box reports no regions at all, so the button that opens it again cannot be one of the
+// box's own. This one is the page's, on the strip above where the box was, and reported always.
+toggleEl.classList.add("on");
+toggleEl.addEventListener("click", () => {
+  const opening = Chat.surface() === Chat.Surface.Hidden;
+  Chat.setSurface(opening ? Chat.Surface.Bubble : Chat.Surface.Hidden);
+  toggleEl.classList.toggle("on", opening);
+});
+
+// Two presses, because nothing brings the pet back once it is gone: a slip on a button this small
+// would end it. The first press asks, a second within three seconds quits, and the core and the
+// speech service end with it because their stdin closes when this process does.
+const quitEl = document.getElementById("quit");
+let quitAsking = null;
+quitEl.addEventListener("click", () => {
+  if (quitAsking !== null) {
+    invoke("quit").catch((e) => console.error("quit: " + String(e)));
+    return;
+  }
+  quitEl.textContent = "確定結束？";
+  quitEl.classList.add("armed");
+  quitAsking = setTimeout(() => {
+    quitAsking = null;
+    quitEl.textContent = "結束";
+    quitEl.classList.remove("armed");
+  }, 3000);
+});
+
+// ---------------------------------------------------------------- settings
+
+// The settings are a window of their own (Docs/DESIGN_Settings.md 2), which Rust opens, or brings
+// forward when it is open already. That window cannot reach `say` or the microphone, and this one
+// cannot write the settings: it is sent them (`applySettings`, below).
+const settingsToggleEl = document.getElementById("settingsToggle");
+settingsToggleEl.addEventListener("click", () => {
+  invoke("open_settings").catch((e) => console.error("open_settings: " + String(e)));
+});
+
+// ---------------------------------------------------------------- click-through
+
+// Rust polls the OS cursor and compares it against these regions, so each region has exactly one
+// source of truth: the element that is actually drawn.
+//
+// Reported as fractions of the viewport, not pixels. A fraction needs no DPI assumption on
+// either side, and this window is a reason to want that: measured 2026-11-03 from a DPI-aware
+// probe, it is 575x775 physical for 460x620 CSS at devicePixelRatio 1.25. An earlier comment
+// here said 460x620 physical and 1:1, which came from a DPI-unaware measurement.
+function regionOf(el) {
+  const r = el.getBoundingClientRect();
+  return {
+    x: r.left / window.innerWidth,
+    y: r.top / window.innerHeight,
+    w: r.width / window.innerWidth,
+    h: r.height / window.innerHeight,
+  };
+}
+
+// Two kinds. Dragging a `character` region moves the window, a `panel` region only takes the
+// click, and where they overlap the panel wins.
+//
+// The gate button is always reported, because it is always drawn and it is the one thing that has
+// to be pressable for the collapsed list to be a list at all. The list itself joins only while it
+// is open: shut it is `display: none`, which has no rectangle, and reporting a zero-area one would
+// make Rust reject the whole report and freeze every region at its last good set.
+// One function, because the headless report prints this list too and a second way to build it is a
+// second thing to keep in step. What the report shows is then what Rust was handed, not something
+// that resembles it.
+function panelRegions() {
+  const mine = [regionOf(toggleEl), regionOf(quitEl), regionOf(settingsToggleEl), regionOf(gateEl)];
+  if (!panelEl.classList.contains("shut")) mine.push(regionOf(panelEl));
+  return Chat.regions().concat(mine);
+}
+
+function reportRegions() {
+  invoke("set_regions", {
+    character: [regionOf(charEl)],
+    panel: panelRegions(),
+  }).catch((e) => console.error("set_regions: " + String(e)));
+}
+reportRegions();
+window.addEventListener("resize", reportRegions);
+new ResizeObserver(reportRegions).observe(charEl);
+// The gate button too: its width follows the count on it, so "3 waiting" and "12 waiting" are
+// different rectangles, and the one Rust holds would be the old one.
+new ResizeObserver(reportRegions).observe(gateEl);
+// The row of buttons too: the quit button grows when it asks, and moves the settings button with it.
+new ResizeObserver(reportRegions).observe(document.getElementById("controls"));
+// `chat.js` redraws by replacing its children, so a change to them is the signal that its
+// geometry moved. The observer runs after the redraw has finished. All four roots, because a
+// turn with no choices changes only one of them and the regions still move.
+const chatWatch = new MutationObserver(reportRegions);
+Object.values(chatEls).forEach((el) => chatWatch.observe(el, { childList: true, subtree: true }));
+
+// The fleet list opens and closes here. Opening it changes what takes clicks and nothing observes
+// a class, so the regions are reported from this one place or the window keeps the old set.
+gateEl.addEventListener("click", () => {
+  const opening = panelEl.classList.contains("shut");
+  panelEl.classList.toggle("shut", !opening);
+  gateEl.classList.toggle("open", opening);
+  reportRegions();
+});
+// Dragging the character moves the window. Only reachable when the cursor is in the rect, which
+// is the proof that the hit test works.
+charEl.addEventListener("mousedown", async (e) => {
+  if (e.button !== 0) return;
+  charEl.style.cursor = "grabbing";
+  try { await appWindow.startDragging(); } catch (err) { console.error(err); }
+  charEl.style.cursor = "grab";
+});
+
+// ---------------------------------------------------------------- the character
+
+// `character.js` owns the figure and is the only file that knows how it is drawn
+// (Docs/DESIGN_Pet.md 2). The spike's rotating quad is gone. It existed to answer whether a canvas
+// composites against a transparent Tauri window, and the figure now answers that by being drawn.
+//
+// Nothing here is awaited at load time. A layer that is missing or a rig that fails to load must
+// leave the panel, the roster and the hit rectangle working, because none of those depend on the
+// figure.
+const canvas = document.getElementById("gl");
+let charStatus = { state: "absent", error: null, renderer: "none" };
+invoke("characters")
+  .then(
+    (list) => {
+      Chat.rename({ character: list.shown.name });
+      Chat.show({ who: Chat.Who.Character, text: list.shown.greeting || OPENING, choices: [] });
+      return Character.mount(canvas, list.shown.rig);
+    },
+    (e) => {
+      Chat.show({ who: Chat.Who.Character, text: OPENING, choices: [] });
+      return { state: "failed", error: "characters: " + String(e), renderer: "none" };
+    },
+  )
+  .then((s) => {
+  charStatus = s;
+  // Once, and here. The mouth follows whatever clip is sounding, a filler or the answer. On a
+  // character that did not mount there is no mouth to drive, and registering is harmless.
+  Character.mouth(Speaker.level);
+  // And the body follows the same clip, on the same clock.
+  Character.gestures(Speaker.timeline);
+  // And she looks toward the cursor. Rust tells the page where it is: the window ignores the mouse
+  // wherever clicks pass through, so the page cannot see it there itself (main.rs, CURSOR_EVENT).
+  // With following switched off the source has nothing to say, and she eases back to straight ahead.
+  Character.look(() => (settings.switches.follow ? cursorAt : null));
+  render();
+});
+let cursorAt = null;
+try {
+  window.__TAURI__.event.listen("cursor", (e) => {
+    cursorAt = e.payload;
+  });
+} catch (e) {
+  console.warn("cursor: " + String(e));
+}
+
+// ---------------------------------------------------------------- the core
+
+// The page's end of the conversation core (src-tauri/src/core.rs, Docs/DESIGN_Pet.md 6.1). Whatever
+// goes wrong with it is said in the bubble, by the character. One that does not answer and does not
+// say why only looks like a broken product.
+function trouble(why) {
+  Chat.show({ who: Chat.Who.Character, text: why, choices: [] });
+}
+
+// A gesture reaches the page twice: as a marker in front of its clause, which is the form the
+// Unreal side parses (Source/VRPhysProto/VRGesturePlan.cpp), and in the event's `tags`. The bubble
+// is for the person to read, so the markers come out of the text and `tags` stays the channel the
+// character's cues will read. The core promises no clause it passes on holds a square bracket, so
+// anything of this shape in the text was put there by the core and taking it out cannot swallow a
+// word the character said.
+const MARKER = /\[[A-Za-z]+\] ?/g;
+function spoken(text) {
+  return text.replace(MARKER, "").trim();
+}
+
+// How the last turn sounded, for the headless report: one entry per part, in the order they came,
+// so `parts.length` is how many the turn had so far. A part says its state and the clip length or
+// the reason, whether its words went into the bubble (`shown`) and, for a voiced one, whether it
+// was scheduled to sound (`scheduled`, null until Speaker has answered). Never the audio.
+let lastVoice = null;
+// What each of those parts' plans held, in the same order: how many actions, and what happened to
+// each cue, counted by result. A cue that did not play is a number here and not an absence. A part
+// with no voice has no plan, and null stands in its place.
+let lastPlan = null;
+function planSummary(plan) {
+  if (!plan || typeof plan !== "object") return null;
+  if (typeof plan.error === "string") return { error: plan.error };
+  const results = {};
+  (Array.isArray(plan.dispositions) ? plan.dispositions : []).forEach((d) => {
+    const key = d && d.result + ":" + d.kind;
+    results[key] = (results[key] || 0) + 1;
+  });
+  return { actions: Array.isArray(plan.actions) ? plan.actions.length : null, dispositions: results };
+}
+// A turn with no voice says why in its own bubble, once per outage (Docs/DESIGN_Voice.md 4, rule 1).
+// After that the words alone arrive, because the same sentence under every answer would bury them.
+// A voiced turn ends the outage, so a service that dies after it worked is explained again.
+let silenceExplained = false;
+
+// The greeting the core was asked to voice and has not voiced yet, as its words (`spoken`, so they
+// compare with an utterance's), or null. Her words are already in the bubble, so when they come back
+// as an utterance only the sound is new: it plays like an answer, and the bubble gets no second
+// copy. A greeting that comes back after the user has spoken is dropped whole, because by then she
+// is thinking about what was said, and the greeting would cut the thinking sound off.
+let greeting = null;
+// What became of the greeting, for the headless report: null before asking, then "none", "asked",
+// "voiced", "silent", "dropped" or "failed: <why>".
+let greeted = null;
+Chat.onChoose(() => {
+  if (greeting) greeting.answered = true;
+});
+
+// One part of the last turn into the report's two records, and the entry back so the page can fill
+// in what it learns later. The first part starts the records over.
+function noteTurn(later, entry, plan) {
+  if (!later || !lastVoice) {
+    lastVoice = { parts: [] };
+    lastPlan = [];
+  }
+  lastVoice.parts.push(entry);
+  lastPlan.push(plan);
+  return entry;
+}
+
+// One line the core printed, as it printed it. `ready` and `turn_end` ask nothing of the page: the
+// first reaches it as a state, below, and nothing here waits for a turn to end. An event this page
+// has not heard of is ignored, which is what lets the core grow new ones.
+function onCoreEvent(p) {
+  if (!p || typeof p.ev !== "string") return;
+  if (p.ev === "utterance") {
+    if (typeof p.text !== "string") return trouble("核心的回答裡沒有文字。");
+    // An answer arrives in parts, each an utterance with its own `part` number, 0 first. Part 0, or
+    // an utterance with no number, is the whole of the old path. A later part belongs to the turn
+    // part 0 began: its words go on the end of that bubble and its voice behind that turn's sound.
+    const later = Number.isInteger(p.part) && p.part >= 1;
+    const words = spoken(p.text);
+    const greets = !later && greeting !== null && greeting.words === words;
+    if (greets) {
+      const answered = greeting.answered;
+      greeting = null;
+      if (answered) {
+        greeted = "dropped";
+        return;
+      }
+    }
+    if (!later) {
+      // The real answer has arrived, so whatever is sounding stops: the thinking sound has done its
+      // job, and an earlier answer still talking would be two voices at once. Stopping here and not
+      // on `turn_end`, which this page ignores on purpose. A later part must not stop anything: what
+      // is sounding is its own turn.
+      Speaker.stop();
+    }
+    const voice = p.voice && typeof p.voice === "object" ? p.voice : { state: "silent", why: "核心沒有給這句聲音，也沒說為什麼。" };
+    let text = words;
+    let heard;
+    // The page a later part becomes, known once `Chat.append` below has added it. Her voice reaches
+    // the part only after that, so the box turns to the page then (`Speaker.queue`'s `onStart`).
+    let page = null;
+    if (voice.state === "voiced") {
+      heard = noteTurn(
+        later,
+        { part: later ? p.part : 0, state: "voiced", samples: voice.samples, frames: Array.isArray(voice.envelope) ? voice.envelope.length : null, shown: null, scheduled: null },
+        planSummary(p.plan),
+      );
+      silenceExplained = false;
+      const sounded = later
+        ? Speaker.queue(voice, p.plan, () => { if (page !== null) Chat.turnTo(page); })
+        : Speaker.speak(voice, p.plan);
+      sounded.then((ok) => { heard.scheduled = ok; }).catch((e) => console.error("voice: " + String(e)));
+    } else {
+      const why = typeof voice.why === "string" ? voice.why : "核心沒說為什麼這句沒有聲音。";
+      heard = noteTurn(later, { part: later ? p.part : 0, state: String(voice.state), why, shown: null }, null);
+      if (!silenceExplained) {
+        silenceExplained = true;
+        text += "\n\n" + why;
+      }
+    }
+    if (greets) greeted = voice.state === "voiced" ? "voiced" : "silent";
+    if (later) {
+      heard.shown = Chat.append(text);
+      if (heard.shown) page = Chat.pages() - 1;
+    } else if (greets) {
+      // Her words went into the bubble when the page loaded; what follows them, the reason a silent
+      // greeting is silent, is all that is new.
+      heard.shown = Chat.append(text.slice(words.length));
+    } else {
+      Chat.show({ who: Chat.Who.Character, text, choices: [] });
+      heard.shown = true;
+    }
+  } else if (p.ev === "error") {
+    trouble("核心說有問題：" + (typeof p.message === "string" ? p.message : "它沒說是什麼"));
+  }
+}
+
+// `starting` and `ready` change nothing on screen. `down` is said, and said once, because the page
+// can hear it twice: from the question below when the core was already gone, and from the event.
+// `restarting` is said too: a change in the settings stopped the core on purpose, and until the new
+// one is ready she cannot answer, so the user is told why (Docs/DESIGN_Settings.md 4). A core that
+// is ready again can be said down again later.
+let coreDown = false;
+// The last state seen, for the headless report. Knowing whether the core is up was otherwise
+// something only a debugger attached to this webview could answer.
+let coreState = null;
+function onCoreState(s) {
+  if (!s || typeof s.state !== "string") {
+    console.error("core-state: " + JSON.stringify(s));
+    return;
+  }
+  coreState = s;
+  if (s.state === "ready") {
+    coreDown = false;
+  } else if (s.state === "restarting") {
+    trouble("等我一下：" + String(s.why));
+  } else if (s.state === "down" && !coreDown) {
+    coreDown = true;
+    trouble("我現在講不出話：" + String(s.why));
+  }
+}
+
+// Asks for her greeting in her voice, once per load, which is once each time she is shown: at start
+// and after the reload that follows a change of character. Only after the listeners are up, so the
+// utterance cannot come back to nobody. Its own failure handler, because a core that cannot be asked
+// is already said in the bubble by `onCoreState`, and her greeting stays there as text.
+function askGreeting() {
+  invoke("greet").then(
+    (text) => {
+      greeting = typeof text === "string" ? { words: spoken(text), answered: false } : null;
+      greeted = greeting ? "asked" : "none";
+    },
+    (e) => {
+      greeted = "failed: " + String(e);
+      console.error("greet: " + String(e));
+    },
+  );
+}
+
+// After the character is on its way, and wrapped, for the reason the bubble side gives above. The
+// listeners come before the question for the reason `get_bubble_side` gives: an event sent before
+// the listener exists is lost, and the core's `ready` is sent long before this page has loaded.
+try {
+  window.__TAURI__.event
+    .listen("core-event", (e) => onCoreEvent(e.payload))
+    .then(() => window.__TAURI__.event.listen("core-state", (e) => onCoreState(e.payload)))
+    .then(() => invoke("core_state"))
+    .then(onCoreState)
+    .then(askGreeting)
+    .catch((e) => {
+      console.error("core wiring: " + String(e));
+      trouble("接不上對話核心：" + String(e));
+    });
+} catch (e) {
+  console.error("core wiring: " + String(e));
+  trouble("接不上對話核心：" + String(e));
+}
+
+// ---------------------------------------------------------------- the microphone
+
+// Hold to talk (Docs/DESIGN_STT.md 4.1.1). The speech input service is a process Rust starts
+// (src-tauri/src/stt.rs). Its lines reach this page as `stt-event`, as it wrote them, and its state
+// as `stt-state`. A spoken sentence leaves through `Chat.submit`, the path a typed one takes.
+//
+// Four states and not booleans, so "listening while unavailable" cannot be built. `micHeld` is the
+// pointer, which is a separate fact: a release can arrive while the service is still recognising.
+const MicState = { Unavailable: "unavailable", Idle: "idle", Listening: "listening", Recognising: "recognising" };
+const MIC_LABEL = { unavailable: "", idle: "", listening: "放開送出", recognising: "辨識中" };
+let micState = MicState.Unavailable;
+let micWhy = "語音輸入還沒準備好";
+let micHeld = false;
+// Whether the service has a press open, from its `capture_started` to the line that ends it. A press
+// can end while the button is still down (the device failed, or it was held past the service's
+// cap), and then letting go has nothing left to wait for.
+let micOpen = false;
+// The (session, seq) pairs already sent. A sentence is handed over at most once, whatever the pipe
+// does (Docs/DESIGN_STT.md 5.2).
+const micSeen = new Set();
+// Said in the bubble once per outage, like a silent voice (Docs/DESIGN_Voice.md 4, rule 1). A
+// sentence that arrives ends the outage.
+let micExplained = false;
+let sttState = null;
+// What the last press came to, for the headless report.
+let lastMic = null;
+
+function setMic(s, why) {
+  micState = s;
+  if (why !== undefined) micWhy = why;
+  micEl.className = "chat-mic " + s;
+  micLabel.textContent = MIC_LABEL[s];
+  micEl.title = s === MicState.Unavailable ? micWhy : "按住說話，放開送出";
+}
+
+function explainMic(why) {
+  if (micExplained) return;
+  micExplained = true;
+  trouble("我現在聽不到你說話：" + why);
+}
+
+function micDown(e) {
+  if (e.button !== 0 || micHeld) return;
+  if (micState === MicState.Unavailable) return explainMic(micWhy);
+  micHeld = true;
+  micEl.setPointerCapture(e.pointerId);
+  setMic(MicState.Listening);
+  invoke("mic_press").catch((err) => {
+    micHeld = false;
+    setMic(MicState.Idle);
+    explainMic(String(err));
+  });
+}
+
+function micUp() {
+  if (!micHeld) return;
+  micHeld = false;
+  setMic(micOpen ? MicState.Recognising : MicState.Idle);
+  invoke("mic_release").catch((err) => {
+    setMic(MicState.Idle);
+    explainMic(String(err));
+  });
+}
+
+micEl.addEventListener("pointerdown", micDown);
+// Up, cancelled, or the capture lost: each one is the release, because a press that missed its
+// release would leave the microphone open (Docs/DESIGN_STT.md 4.1.1).
+for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) micEl.addEventListener(type, micUp);
+
+function onSttEvent(p) {
+  if (!p || typeof p.ev !== "string") return;
+  if (p.ev === "capture_started") {
+    // Sent before the device opens, so the character is quiet before the microphone can hear it
+    // (Docs/DESIGN_STT.md 5.1).
+    Speaker.stop();
+    micOpen = true;
+  } else if (p.ev === "transcript") {
+    micOpen = false;
+    lastMic = { got: "transcript", session: p.session, seq: p.seq, timings: p.timings || null };
+    const key = p.session + ":" + p.seq;
+    if (typeof p.text === "string" && !micSeen.has(key)) {
+      micSeen.add(key);
+      micExplained = false;
+      Chat.submit(p.text);
+    }
+    if (!micHeld) setMic(MicState.Idle);
+  } else if (p.ev === "nothing") {
+    micOpen = false;
+    lastMic = { got: "nothing", session: p.session, why: p.why };
+    if (micHeld) return;
+    setMic(MicState.Idle);
+    // A press that heard nothing changes nothing else on screen, so the button says so until the
+    // next press. A cancel or a lost device is explained elsewhere or was the user's own doing.
+    if (p.why === "no_speech" || p.why === "too_short" || p.why === "no_words") micLabel.textContent = "沒聽到";
+  } else if (p.ev === "error") {
+    lastMic = { got: "error", kind: p.kind, message: p.message };
+    if (p.session !== null && p.session !== undefined) micOpen = false;
+    // A model failure is followed by the service exiting, and the state that brings says it.
+    if (p.kind === "model") return;
+    explainMic(typeof p.message === "string" ? p.message : "語音輸入沒說是什麼問題");
+    if (!micHeld) setMic(MicState.Idle);
+  }
+}
+
+function onSttState(s) {
+  if (!s || typeof s.state !== "string") {
+    console.error("stt-state: " + JSON.stringify(s));
+    return;
+  }
+  sttState = s;
+  if (s.state === "ready") {
+    if (!micHeld) setMic(MicState.Idle);
+    // Models loaded and no microphone found at start. Pressing still tries, because one can be
+    // plugged in, and a failed press is explained; the title says it before then.
+    if (s.deviceError) micEl.title = "沒有找到麥克風：" + s.deviceError;
+  } else if (s.state === "restarting") {
+    // Asked for in the settings, so the button says why and the bubble is left to the dialogue.
+    micHeld = false;
+    micOpen = false;
+    setMic(MicState.Unavailable, String(s.why));
+  } else if (s.state === "down") {
+    micHeld = false;
+    micOpen = false;
+    setMic(MicState.Unavailable, String(s.why));
+    explainMic(String(s.why));
+  }
+}
+
+// After the character, wrapped, and with the listeners before the question, for the reasons the
+// core's wiring gives. A service that cannot be reached leaves typing working.
+try {
+  window.__TAURI__.event
+    .listen("stt-event", (e) => onSttEvent(e.payload))
+    .then(() => window.__TAURI__.event.listen("stt-state", (e) => onSttState(e.payload)))
+    .then(() => invoke("stt_state"))
+    .then(onSttState)
+    .catch((e) => {
+      console.error("stt wiring: " + String(e));
+      setMic(MicState.Unavailable, "接不上語音輸入：" + String(e));
+    });
+} catch (e) {
+  console.error("stt wiring: " + String(e));
+  setMic(MicState.Unavailable, "接不上語音輸入：" + String(e));
+}
+
+// ---------------------------------------------------------------- applying the settings
+
+// The settings in effect. Rust checked every field before sending them (src-tauri/src/settings.rs),
+// so this applies them and does not check them again. Until Rust answers, these are the design's
+// defaults, the same ones the stylesheet's `:root` starts from.
+let settings = {
+  volume: 0.8,
+  scale: { window: 1, figure: 1, ui: 1 },
+  switches: { voice: true, fillers: true, mic: true, follow: true, on_top: true, autostart: false },
+  look: { bubble_opacity: 0.92, font_size: 13, theme: "paper" },
+};
+
+// The page's share of the settings. Rust has done its own before sending them: the window's size
+// and the page's zoom for `scale.window`, `set_always_on_top` for `switches.on_top`, and refusing
+// `mic_press` while the microphone is off. Following the cursor needs nothing here, because the look
+// source reads `settings` each frame. Her size is `--figure`, which resizes `#char`, and the
+// observers on it lay her out again and report the new region.
+function applySettings(s) {
+  if (!s || typeof s !== "object") return;
+  settings = s;
+  Speaker.configure({ volume: s.volume, voice: s.switches.voice, fillers: s.switches.fillers });
+  micEl.hidden = !s.switches.mic;
+  const root = document.documentElement.style;
+  root.setProperty("--figure", String(s.scale.figure));
+  root.setProperty("--ui", String(s.scale.ui));
+  root.setProperty("--say-size", s.look.font_size + "px");
+  root.setProperty("--bubble-opacity", String(s.look.bubble_opacity));
+  if (s.look.theme !== themeAsked) loadTheme(s.look.theme);
+  // Larger text makes larger boxes, and a change of style is nothing the observers above see.
+  reportRegions();
+}
+
+// ---------------------------------------------------------------- the interface theme
+
+// The theme in effect, from Rust (main.rs `themes`), which scanned the folders and fell back to the
+// default with a reason when the chosen one cannot be shown. A theme is values and not CSS: each
+// one is checked again here before it is written into a custom property, so a value that got past
+// Rust still could not close the property and start another declaration, and a picture's URL is
+// only ever one of the two places Rust serves theme files from.
+let themeAsked = null;
+const THEME_COLOR = /^#[0-9a-f]{6}$/;
+const THEME_URL = /^(themes\/|http:\/\/theme\.localhost\/|theme:\/\/localhost\/)[a-z0-9_.\-\/]+\.(svg|png)$/;
+
+function applyTheme(t) {
+  const root = document.documentElement;
+  for (const role of ["accent", "paper", "ink", "border", "controls"]) {
+    const c = String(t.colors[role]);
+    if (THEME_COLOR.test(c)) root.style.setProperty("--" + role, c);
+  }
+  if (Number.isInteger(t.radius) && t.radius >= 0 && t.radius <= 28) root.style.setProperty("--radius", t.radius + "px");
+  const picture = (url) => (typeof url === "string" && THEME_URL.test(url) ? 'url("' + url + '")' : "none");
+  root.style.setProperty("--icon", picture(t.icon));
+  root.style.setProperty("--paper-texture", picture(t.paper_texture));
+  root.classList.toggle("no-icon", picture(t.icon) === "none");
+  // A radius changes the controls' rectangles no more than their corners, but the strip's buttons
+  // and the field are reported from their boxes, and this costs one message.
+  reportRegions();
+}
+
+function loadTheme(id) {
+  themeAsked = id;
+  invoke("themes").then(
+    (list) => {
+      if (themeAsked !== id) return;
+      if (list.fallback) console.warn("theme: " + list.fallback);
+      applyTheme(list.shown);
+    },
+    (e) => console.error("themes: " + String(e)),
+  );
+}
+
+// After the character, wrapped, and with the listener before the question, for the reasons the
+// core's wiring gives. Settings that cannot be read leave the defaults standing.
+try {
+  window.__TAURI__.event
+    .listen("settings", (e) => applySettings(e.payload))
+    .then(() => invoke("get_settings"))
+    .then((loaded) => applySettings(loaded.settings))
+    .catch((e) => console.error("settings wiring: " + String(e)));
+} catch (e) {
+  console.error("settings wiring: " + String(e));
+}
+
+// The frame counter stays the page's own rather than the character's. It measures the rate this
+// window is actually presented at, which is what D1's "30 fps or more" is about.
+let frames = 0, fps = 0, lastFpsAt = performance.now();
+
+function frame(now) {
+  frames++;
+  if (now - lastFpsAt >= 1000) {
+    fps = Math.round((frames * 1000) / (now - lastFpsAt));
+    frames = 0;
+    lastFpsAt = now;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------------------------------------------------------------- the fleet
+
+const HERE = "D:\\Your_AImate";
+let fleetErr = null, sessions = [], statuses = new Set();
+
+function age(ms) {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  return Math.round(s / 3600) + "h";
+}
+
+async function poll() {
+  try {
+    sessions = await invoke("fleet");
+    fleetErr = null;
+    for (const s of sessions) statuses.add(s.status);
+  } catch (e) {
+    fleetErr = String(e);
+  }
+  render();
+}
+
+// This page assigns innerHTML nowhere, and `pet_page` fails if it ever does again.
+//
+// There was an `esc()` here and a comment saying everything external went through it. The diag
+// block then appended `fleetErr` straight into innerHTML without calling it, and `fleetErr` is the
+// `claude agents --json` process's own stderr carried through verbatim (main.rs `run_json`). So
+// another process's output reached markup in a page that holds `invoke`, past a guard that said it
+// could not. An escaper you must remember to call is not a guard, it is a convention, and this is
+// what a convention costs. The escaper is deleted rather than fixed: leaving it invites the next
+// person to reach for it instead of for a text node.
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = text;
+  return n;
+}
+
+function render() {
+  const waiting = sessions.filter((s) => s.waiting).length;
+  // Two of the strings on this line come from outside: `fleetErr` is the CLI's stderr, and
+  // `charStatus.error` can carry a browser's own message about a file it could not load. Nodes and
+  // textContent, like the rows, so neither can be markup.
+  const dot = () => document.createTextNode(" · ");
+  const line = el("div");
+  line.append("character ", el("b", null, charStatus.state), dot());
+  line.append(el("b", null, String(fps)), " fps", dot());
+  line.append("sessions ", el("b", null, fleetErr ? "?" : String(sessions.length)), dot());
+  line.append(el("b", waiting ? "wait" : null, String(waiting)), " waiting", dot());
+  line.append("status seen ", el("b", null, [...statuses].join(", ") || "-"));
+  diagEl.replaceChildren(line);
+  if (charStatus.error) diagEl.append(el("div", "err", "character: " + charStatus.error));
+  if (fleetErr) diagEl.append(el("div", "err", "fleet: " + fleetErr));
+  if (!charStatus.error) diagEl.append(el("div", null, "renderer: " + charStatus.renderer));
+
+  // The collapsed list's whole job, and the reason it is allowed to be collapsed: the count is on
+  // the button, so noticing does not depend on opening anything. `?` and not `0` when the fleet
+  // command failed, because "nothing is waiting" and "I could not look" must not look the same.
+  gateNEl.textContent = fleetErr ? "?" : String(waiting);
+  gateEl.classList.toggle("wait", !fleetErr && waiting > 0);
+
+  // Waiting first, because that is the whole point of the product. Then most recent.
+  //
+  // Built as DOM nodes with textContent, not as an HTML string. Session names, working directories
+  // and now the notification message are all external text, and two of the three can carry model
+  // output; textContent cannot be talked into being markup, whereas an escaper is one forgotten
+  // call away from being wrong.
+  rowsEl.replaceChildren(
+    ...sessions
+      .slice()
+      .sort((a, b) => (b.waiting ? 1 : 0) - (a.waiting ? 1 : 0) || b.startedAt - a.startedAt)
+      .map((s) => {
+        const name = s.name || s.cwd.split("\\").pop() || s.sessionId.slice(0, 8);
+        // Rust decides whether there is a line to show and how long it may be (fleet::asking_line).
+        // The page only asks whether it got one.
+        const asking = s.waiting ? s.waitingMessage : null;
+
+        const row = el("div", "row" + (s.waiting ? " wait" : "") + (s.cwd === HERE ? " here" : ""));
+        row.append(el("span", "st", s.waiting ? "waiting" : s.status));
+
+        const mid = el("div", "mid");
+        const nm = el("span", "nm", name);
+        nm.title = asking || s.cwd;
+        mid.append(nm);
+        if (asking) mid.append(el("div", "ask", asking));
+        row.append(mid);
+
+        row.append(el("span", "ag", s.waiting && s.waitingSince ? age(s.waitingSince) : age(s.startedAt)));
+        return row;
+      }),
+  );
+}
+
+poll();
+setInterval(poll, 3000);
+
+// Report once, a couple of seconds in, so fps and the fleet hold real values by then. This is
+// the only way a headless run reads the spike's answers.
+setTimeout(async () => {
+  // Sampled before the payload is built, because it needs real time to pass, and the report is
+  // the only channel a headless run has to read any of this.
+  const motion = await Character.sampleMotion(600);
+  const mouth = await Character.sampleMouth(600);
+  let shot = null;
+  const png = Character.shot();
+  if (png) {
+    // The host writes the file; a WebView cannot. A picture that fails to save must not cost us
+    // the rest of the report, so the outcome lands as a string either way.
+    shot = await invoke("save_shot", { dataUrl: png }).catch((e) => "failed: " + String(e));
+  }
+  const r = charEl.getBoundingClientRect();
+  invoke("report", {
+    payload: {
+      character: charStatus,
+      drawn: Character.drawn(),
+      logged,
+      motion,
+      mouth,
+      shot,
+      fps,
+      devicePixelRatio: window.devicePixelRatio,
+      canvasPx: [canvas.width, canvas.height],
+      viewportCss: [window.innerWidth, window.innerHeight],
+      hitRectCss: [r.left, r.top, r.width, r.height],
+      // Rows actually in the DOM, and how many of them carry a line about what the session is
+      // asking. The report fires on its own timer, so without these a render() that threw would
+      // still produce a healthy-looking report: `sessions` is set before render runs.
+      rows: rowsEl.children.length,
+      rowsAsking: rowsEl.querySelectorAll(".ask").length,
+      hitRectFrac: [
+        +(r.left / window.innerWidth).toFixed(4),
+        +(r.top / window.innerHeight).toFixed(4),
+        +(r.width / window.innerWidth).toFixed(4),
+        +(r.height / window.innerHeight).toFixed(4),
+      ],
+      chatSurface: Chat.surface(),
+      // What the pet thinks of the core, so a probe outside the window can see it. Without this
+      // the only way to know whether the core is up is to attach a debugger to the webview.
+      coreState: coreState,
+      // What the pet thinks of the speech input service, the button's state, and what the last
+      // press came to, for the same reason as `coreState`.
+      stt: { state: sttState, mic: micState, last: lastMic },
+      // How the last turn sounded, part by part: voiced with its length, or silent with the reason
+      // shown, and whether each part's words reached the bubble and its voice was scheduled.
+      voice: lastVoice,
+      // What became of her greeting: asked, voiced, silent, dropped, failed, or none to say.
+      greeted,
+      // What each part's plan held, as counts.
+      plan: lastPlan,
+      // The collapsed fleet list: what its button says, whether it is hinting, whether it is open.
+      // The hint is the premise of the whole layout (Docs/DESIGN_Pet.md 4.4), so a headless run has
+      // to be able to see it without a screenshot.
+      gate: {
+        waiting: gateNEl.textContent,
+        hinting: gateEl.classList.contains("wait"),
+        open: !panelEl.classList.contains("shut"),
+      },
+      panelFrac: panelRegions().map((g) => [g.x, g.y, g.w, g.h].map((v) => +v.toFixed(4))),
+      fleetError: fleetErr,
+      sessions: sessions.length,
+      waiting: sessions.filter((s) => s.waiting).length,
+      waitingIds: sessions.filter((s) => s.waiting).map((s) => s.sessionId),
+      statuses: [...statuses],
+      kinds: [...new Set(sessions.map((s) => s.kind))],
+      userAgent: navigator.userAgent,
+    },
+  }).catch((e) => console.error(e));
+}, 2500);
+</script>
+</body>
+</html>

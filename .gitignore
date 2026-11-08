@@ -1,0 +1,29 @@
+# Build output
+Pet/src-tauri/target/
+Pet/crates/vrcue/target/
+Pet/src-tauri/gen/
+ChatCore/target/
+# The speech input service. Its build also caches the sherpa-onnx prebuilt library (about 1.2 GB)
+# under target/.
+Stt/target/
+
+# Third-party Live2D runtimes and sample models. Their licences are not MIT; they never enter git.
+Pet/vendor/
+Pet/ui/vendor/
+CubismSdkForWeb-*/
+
+# Python
+__pycache__/
+*.pyc
+# The voice service venv. start_pet.ps1 looks here when VRPET_PYTHON is not set.
+.venv/
+
+# Secrets. API keys live in .env or environment variables, never in the repo.
+.env
+.env.*
+!.env.example
+
+# Editors
+.vs/
+.idea/
+.vscode/

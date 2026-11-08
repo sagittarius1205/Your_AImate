@@ -1,0 +1,13 @@
+{
+  "name": "夜色",
+  "colors": {
+    "accent": "#e8956f",
+    "paper": "#262a33",
+    "ink": "#ebe6dc",
+    "border": "#454b59",
+    "controls": "#2e333e"
+  },
+  "radius": 12,
+  "icon": "icon.svg",
+  "paper_texture": "paper.svg"
+}
