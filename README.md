@@ -1,6 +1,6 @@
 **繁體中文** · [English](README.en.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-# AImate
+# AImate(beta)
 
 **AImate：把自己常用的AI打造虛擬人物、虛擬助理協助處理事情**
 
