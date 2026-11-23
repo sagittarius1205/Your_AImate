@@ -4,7 +4,7 @@
 
 **AImate：把自己常用的AI打造虛擬人物、虛擬助理協助處理事情**
 
-AImate 是住在 Windows 桌面角落的 2D 助理，長相、名字、個性和聲音都可以自己設計。你打字或按住麥克風跟她說話，她用你自己的 AI 帳號想答案，再用在你電腦上合成的聲音說出來。目前接的 AI 是 Claude（透過 Claude Code）。
+AImate 是住在 Windows 桌面角落的 2D 助理，長相、名字、個性和聲音都可以自己設計。你打字或按住麥克風跟她說話，她用你自己的 AI 帳號想答案，再用在你電腦上合成的聲音說出來。預設接的 AI 是 Claude（透過 Claude Code），也可以改用你電腦上 Ollama 的模型。
 
 預設角色是小克，有制服和禮服兩套衣服。想換成你自己的角色，照[角色教學](guide/character.md)做。
 
@@ -17,7 +17,8 @@ AImate 是住在 Windows 桌面角落的 2D 助理，長相、名字、個性和
 ## 她會做什麼
 
 - **聊天。** 對話框是視覺小說的樣子。打字，或按住麥克風說話、放開送出。
-- **用你的 Claude 回答。** 背後跑的是你電腦上的 `claude` 指令，用的是你自己的登入。這個專案不收費、沒有伺服器，也不碰你的金鑰。設定裡可以選 `haiku` 或 `sonnet`。
+- **用你的 Claude 回答。** 背後跑的是你電腦上的 `claude` 指令，用的是你自己的登入。這個專案不收費、沒有伺服器，用 Claude 時也不碰你的金鑰。設定的「模型」分頁可以選「Claude Haiku」或「Claude Sonnet」。
+- **也能用本機的模型。** 設定裡可以把對話模型換成你電腦上 Ollama 的模型。這時你說的話不會送出你的電腦，聊天也不需要 Claude Code。
 - **用本機的聲音說話。** 語音由 VoxCPM2 在你的顯示卡上合成，嘴型跟著聲音動。她的聲音是用文字描述合成出來的，沒有用任何真人的錄音。
 - **在本機聽懂你。** 語音辨識用 SenseVoice，支援中、英、日、韓、粵語，聲音不會傳出你的電腦。
 - **會動。** 眼睛和身體跟著游標轉，說話時有手勢，會眨眼。
@@ -32,7 +33,7 @@ AImate 是住在 Windows 桌面角落的 2D 助理，長相、名字、個性和
 | Windows 10 或 11，64 位元 | 是 | 目前只在 Windows 11 上測過 |
 | [Rust](https://rustup.rs/)（stable，MSVC 工具鏈） | 是 | 安裝 Rust 時要一起裝 Visual Studio Build Tools 的「使用 C++ 的桌面開發」 |
 | WebView2 Runtime | 是 | Windows 11 已內建 |
-| [Claude Code](https://code.claude.com/docs/en/overview) | 是 | 在終端機打 `claude` 要能登入並回答 |
+| [Claude Code](https://code.claude.com/docs/en/overview) | 預設要 | 在終端機打 `claude` 要能登入並回答。對話模型改用本機的 Ollama 時，聊天不需要它 |
 | 麥克風 | 否 | 只有語音輸入要用 |
 | NVIDIA 顯示卡，8 GB 以上顯存 | 否 | 只有本機語音要用，實測吃 7.6 GB |
 | Python 3.11 和 [uv](https://docs.astral.sh/uv/) | 否 | 只有本機語音要用 |
@@ -84,7 +85,10 @@ powershell -ExecutionPolicy Bypass -File Scripts\start_pet.ps1
 
 腳本先在背景開語音服務，再開桌寵。要桌面捷徑的話，加上 `-Shortcut` 跑一次。
 
+建置完成後，也可以在檔案總管裡雙擊 repo 根目錄的 `AImate.bat`。它在背景跑同一支 `Scripts\start_pet.ps1`，語音服務沒開時一樣會先開它。還沒建置的話，視窗會寫 `AImate is not built yet`，先照「安裝」的第 1 步建置三個程式。
+
 - 角色旁邊有「設定」「結束」「對話」三個按鈕。設定有角色、聲音、外觀、開關、模型五個分頁，「開關」裡可以設定開機時啟動。
+- 要改用本機的 Ollama，在「模型」分頁把「對話模型」改成「本機或自訂（OpenAI 相容）」。網址預設是 Ollama 在本機的位址 `http://127.0.0.1:11434/v1`，桌寵會向這個網址查已經裝好的模型，在「模型」清單選一個。清單是空的話，先用 `ollama pull` 裝一個模型，再按「重新列出」。用這種方式時，她只記得最近 8 輪對話。網址也可以填其他 OpenAI 相容服務的 `https://` 位址，金鑰放在環境變數裡，「金鑰的環境變數」只填變數的名稱。用遠端服務時，你說的每句話都會送到那家服務。目前只用 Ollama 驗證過。
 - 「結束」會關掉桌寵、對話核心和語音辨識。語音服務會留著，下次啟動就不用再等模型載入。
 
 ## 設計你自己的角色
@@ -92,7 +96,7 @@ powershell -ExecutionPolicy Bypass -File Scripts\start_pet.ps1
 一個角色是一個資料夾，放進 `%USERPROFILE%\.vrpet\characters\` 再重開桌寵，就能在設定裡換成她，不用重新建置。
 
 - **只改名字和個性：** 在設定的「角色」分頁按「複製到我的資料夾」，改複製出來的那一份，按「存檔」。
-- **換成另一張圖：** 用能改圖的 AI 做出同一張圖的五個版本，再用 `Scripts\live2d\` 的兩支腳本切成圖層。
+- **換成另一張圖：** 用能改圖的 AI 做出同一張圖的五個版本，再用 `Scripts\live2d\` 的腳本切成圖層。
 - **換聲音：** 放一段 `voice.wav`，她就用那個聲音說話。
 
 完整的步驟、每個欄位的限制和排錯，見[角色教學](guide/character.md)。介面主題的做法也在同一份。

@@ -23,7 +23,7 @@ Run all commands below in PowerShell, from the repo root. `%USERPROFILE%\.vrpet`
 2. Xiaoke is a built-in character, so you cannot edit her directly. In the field to the left of **複製到我的資料夾** (Copy to my folder), enter a new folder name, for example `my-xiaoke`. Then click the button.
 3. The pet switches to the copy. Edit **名字** (Name), **服裝** (Outfit), **個性** (Personality), **開場白** (Greeting) and **口頭禪** (Catchphrases), then click **存檔** (Save). After you save, she uses the new settings at once. No restart is needed.
 
-**個性** (Personality) is the character description given to Claude, up to 2000 characters. The program adds the fixed rules (she can hear and speak, and how she gestures). Here you only write who she is and how she talks.
+**個性** (Personality) is the character description given to the chat model, up to 2000 characters. The program adds the fixed rules (she can hear and speak, and how she gestures). Here you only write who she is and how she talks.
 
 The copied folder is at `%USERPROFILE%\.vrpet\characters\my-xiaoke\`. It holds Xiaoke's layers, `layers.json`, `rig.json` and `character.json`. Later, to change the image or the voice, you can start from this folder.
 
@@ -39,7 +39,7 @@ The cutting script cuts one full-body illustration into 22 movable layers, for e
 | `backhair.png` | Only the back hair, with the parts hidden by the head and body filled in | `brief_backhair.md` |
 | `face_states.png` | Eyes closed and mouth open | `brief_face.md` |
 
-These five instructions are in `Scripts/live2d/`. They are English prompts for an image-editing AI. Xiaoke's five images were made with the image-editing feature of ChatGPT.
+These five instructions are in `Scripts/live2d/`. They are English prompts for an image-editing AI. Xiaoke's five images were made with the image-editing feature of ChatGPT. The eye color map has its own instructions, `brief_eyemap.md`, used in section 3.
 
 1. Save the original image as `source.png` in the working folder, for example `%USERPROFILE%\aimate-art\hana\`. The original must be a front-facing, upright, full-body image, with the hands a little away from the body and the feet apart. Xiaoke's original is a 1024×1536 portrait image.
 2. One item in `brief_master.md` describes Xiaoke's look (hair, sun hair clip, jacket, pleated skirt, boots). First change this item to describe your character.
@@ -75,7 +75,18 @@ $work = "$env:USERPROFILE\aimate-art\hana"
 
 Then open `rest_stack.png` and look at it. It shows all the layers stacked at rest. It should look the same as the master.
 
-The color thresholds that split the eyes were set for Xiaoke's image. With a different face, the eye white, iris and lashes may split wrong. For example, if the eye white is only a thin slit, the iris on the pet gets cut off. For a second outfit made from the same face, `Scripts\live2d\reuse_eyes.py` can reuse the eyes already split for the first outfit. Usage is at the top of the file.
+The color thresholds that split the eyes were set for Xiaoke's image, and the iris they look for is her bright orange. With a different face, the eye white, iris and lashes may split wrong. For example, if the eye white is only a thin slit, the iris on the pet gets cut off. If the iris is not orange, `layers.py` may not find it, and it prints an error and stops partway. For a second outfit made from the same face, `Scripts\live2d\reuse_eyes.py` can reuse the eyes already split for the first outfit. Usage is at the top of the file.
+
+If the eyes split wrong or `layers.py` stops, make an eye color map, and `layers.py` splits the eyes by it:
+
+1. Run `.venv-art\Scripts\python.exe Scripts\live2d\eyemap.py crop $work`. It finds both eyes with `partmap.png`, cuts them out of `master.png`, and scales them up to a 1536×1024 `eyes_crop.png`. It records where it cut in `eyes_crop.json`.
+2. Give `eyes_crop.png` and `brief_eyemap.md` to the image-editing AI. As with the other images, have it edit `eyes_crop.png`, not draw a new image. These instructions ask for only four colors. The eye whites are cyan `#00FFFF`, the irises are blue `#0000FF`, the lashes and eyelid lines are black `#000000`, and everything else is magenta `#FF00FF`.
+3. Save the result as `eyes_map.png` in the working folder. Then run `.venv-art\Scripts\python.exe Scripts\live2d\eyemap.py paste $work`. It scales `eyes_map.png` back to the eyes' original place and size, and saves it as `eyemap.png`.
+4. Run `layers.py` again, with the same command as above.
+
+When the working folder has an `eyemap.png`, `layers.py` uses it every time to split the eyes, and it prints one more line, `eyes from eyemap.png: white … px, iris … px, lashes … px`.
+
+This method needs `partmap.png` and `master.png` to be the same size. If `cut.py` prints `partmap size … differs from master`, the two are different sizes, and `eyemap.py` cuts in the wrong place.
 
 ## 4. Write `rig.json` to make the layers move
 
@@ -125,8 +136,8 @@ Each layer is one solid piece. It can only move, rotate and scale. It does not d
 
 | Field | Required | Limits | Where it is used |
 | --- | --- | --- | --- |
-| `name` | Yes | 1 to 32 characters, no line breaks | The settings list, the name tag in the dialogue box, the description given to Claude |
-| `persona` | Yes | 1 to 2000 characters | The character description given to Claude |
+| `name` | Yes | 1 to 32 characters, no line breaks | The settings list, the name tag in the dialogue box, the description given to the chat model |
+| `persona` | Yes | 1 to 2000 characters | The character description given to the chat model |
 | `outfit` | No | 1 to 16 characters, no line breaks or square brackets | Shown only in the settings list, as "Hana (Uniform)". It tells apart different outfits of the same character |
 | `greeting` | No | Up to 200 characters, no square brackets | Said once when the pet starts and when you switch to her |
 | `voice` | No | Must be exactly `"voice.wav"`, and the file must exist in the folder | Her voice. See section 7 |
@@ -184,7 +195,7 @@ Common reasons for a grayed-out row:
 - A file is too large. The limits are 16 MB per PNG, 1 MB per JSON file (8 MB for `fillers.json`), 10 MB for `voice.wav`, and 200 MB for the whole folder.
 - The folder contains a shortcut (symlink or junction). For safety, the pet does not follow shortcuts, and it does not load the character at all.
 
-Someone else may have made a character folder, or you may have downloaded it from the internet. So the pet reads only the PNG, JSON and WAV files at the top level of the folder, and it checks the size of each file. The **個性** (Personality) text goes to Claude, but the Claude in the chat core has no tools and cannot touch your files.
+Someone else may have made a character folder, or you may have downloaded it from the internet. So the pet reads only the PNG, JSON and WAV files at the top level of the folder, and it checks the size of each file. The **個性** (Personality) text goes to the chat model you chose. She herself has no tools and cannot touch your files.
 
 ## 9. Interface themes
 
@@ -210,11 +221,11 @@ You can also change the colors, the corner radius and the two small images of th
 | --- | --- | --- | --- |
 | `name` | Yes | 1 to 32 characters | The **外觀** (Appearance) tab in the settings |
 | `colors.accent` | Yes | `#rrggbb` | Borders on hover and while typing. Her name uses accent shifted 40% toward ink |
-| `colors.paper` | Yes | `#rrggbb` | Background color of the dialogue box, the options and the chat history |
+| `colors.paper` | Yes | `#rrggbb` | Background color of the dialogue box, the options, the chat history and the settings window |
 | `colors.ink` | Yes | `#rrggbb` | Text color |
 | `colors.border` | Yes | `#rrggbb` | All borders |
-| `colors.controls` | Yes | `#rrggbb` | Background color of the button bar, the input box and the microphone button |
-| `radius` | Yes | Integer from 0 to 28, in px | Corner radius of the dialogue box |
+| `colors.controls` | Yes | `#rrggbb` | Background color of the button bar, the input box and the microphone button, and of the buttons and fields in the settings window |
+| `radius` | Yes | Integer from 0 to 28, in px | Corner radius of the dialogue box and the settings window |
 | `icon` | No | One `.svg` or `.png` in the folder | Small icon next to her name in the dialogue box |
 | `paper_texture` | No | One `.svg` or `.png` in the folder | Texture laid over the background color |
 

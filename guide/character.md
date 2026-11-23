@@ -21,7 +21,7 @@ AImate 的角色是一個資料夾。資料夾裡有圖層 PNG、`layers.json`�
 2. 小克是內建角色，不能直接改。在「複製到我的資料夾」左邊的欄位填一個新的資料夾名稱，例如 `my-xiaoke`，再按按鈕。
 3. 桌寵會換成複製出來的這一份。改「名字」「服裝」「個性」「開場白」「口頭禪」，按「存檔」。存檔後她馬上換成新的設定，不用重開。
 
-「個性」就是給 Claude 的角色說明，最多 2000 字。固定的規則（她聽得到也會說話、怎麼做手勢）由程式補上，這裡只要寫她是誰、怎麼說話。
+「個性」就是給對話模型的角色說明，最多 2000 字。固定的規則（她聽得到也會說話、怎麼做手勢）由程式補上，這裡只要寫她是誰、怎麼說話。
 
 複製出來的資料夾在 `%USERPROFILE%\.vrpet\characters\my-xiaoke\`，裡面有小克的圖層、`layers.json`、`rig.json` 和 `character.json`。之後要換圖或換聲音，可以從這個資料夾開始改。
 
@@ -37,7 +37,7 @@ AImate 的角色是一個資料夾。資料夾裡有圖層 PNG、`layers.json`�
 | `backhair.png` | 只留後髮，把被頭和身體擋住的部分補完整 | `brief_backhair.md` |
 | `face_states.png` | 閉眼加張嘴 | `brief_face.md` |
 
-這五份指示在 `Scripts/live2d/`，是寫給能改圖的 AI 的英文提示。小克的五張是用 ChatGPT 的改圖功能做的。
+這五份指示在 `Scripts/live2d/`，是寫給能改圖的 AI 的英文提示。小克的五張是用 ChatGPT 的改圖功能做的。眼睛的色塊圖另有一份 `brief_eyemap.md`，用法在第 3 節。
 
 1. 原圖存成 `source.png`，放進工作資料夾，例如 `%USERPROFILE%\aimate-art\hana\`。原圖要是正面、直立的全身圖，雙手稍微離開身體，雙腳分開。小克的原圖是 1024×1536 的直式圖。
 2. `brief_master.md` 裡有一項在描述小克的外觀（頭髮、太陽髮夾、外套、百褶裙、靴子）。先把這一項改成你的角色。
@@ -73,7 +73,18 @@ $work = "$env:USERPROFILE\aimate-art\hana"
 
 再打開 `rest_stack.png` 看一眼。它是所有圖層靜止時疊起來的樣子，看起來應該和母版一樣。
 
-拆眼睛的顏色門檻是照小克的圖定的。換一張臉時，眼白、虹膜和睫毛可能拆錯，例如眼白只剩一條縫，桌寵上的虹膜就會被切掉。同一張臉改出來的第二套衣服可以用 `Scripts\live2d\reuse_eyes.py` 沿用第一套拆好的眼睛，用法寫在檔案開頭。
+拆眼睛的顏色門檻是照小克的圖定的，虹膜找的就是她的亮橘色。換一張臉時，眼白、虹膜和睫毛可能拆錯，例如眼白只剩一條縫，桌寵上的虹膜就會被切掉。虹膜不是橘色時，`layers.py` 可能找不到虹膜，印出錯誤後中途停下。同一張臉改出來的第二套衣服可以用 `Scripts\live2d\reuse_eyes.py` 沿用第一套拆好的眼睛，用法寫在檔案開頭。
+
+眼睛拆錯或 `layers.py` 停下時，多做一張眼睛的色塊圖，讓 `layers.py` 照它拆眼睛：
+
+1. 執行 `.venv-art\Scripts\python.exe Scripts\live2d\eyemap.py crop $work`。它用 `partmap.png` 找出兩眼的位置，從 `master.png` 裁下兩眼，放大成 1536×1024 的 `eyes_crop.png`，裁的位置記在 `eyes_crop.json`。
+2. 把 `eyes_crop.png` 和 `brief_eyemap.md` 交給改圖 AI。和前面幾張一樣，要它拿 `eyes_crop.png` 來改，不要重畫。這份指示要它只用四種顏色。眼白塗青色 `#00FFFF`，虹膜塗藍色 `#0000FF`，睫毛和眼線塗黑色 `#000000`，其他全部塗洋紅 `#FF00FF`。
+3. 結果存成 `eyes_map.png`，放進工作資料夾，再執行 `.venv-art\Scripts\python.exe Scripts\live2d\eyemap.py paste $work`。它把 `eyes_map.png` 縮回兩眼原來的位置和大小，存成 `eyemap.png`。
+4. 照上面的指令再跑一次 `layers.py`。
+
+工作資料夾裡有 `eyemap.png` 時，`layers.py` 每次都用它拆眼睛，並多印一行 `eyes from eyemap.png: white … px, iris … px, lashes … px`。
+
+這個做法要 `partmap.png` 和 `master.png` 一樣大。`cut.py` 印出 `partmap size … differs from master` 時，表示兩張不一樣大，`eyemap.py` 會裁錯位置。
 
 ## 4. 寫 `rig.json`：讓圖層動起來
 
@@ -123,8 +134,8 @@ $work = "$env:USERPROFILE\aimate-art\hana"
 
 | 欄位 | 必要 | 限制 | 用在哪裡 |
 | --- | --- | --- | --- |
-| `name` | 是 | 1 到 32 字，不能有換行 | 設定清單、對話框的名牌、給 Claude 的說明 |
-| `persona` | 是 | 1 到 2000 字 | 給 Claude 的角色說明 |
+| `name` | 是 | 1 到 32 字，不能有換行 | 設定清單、對話框的名牌、給對話模型的說明 |
+| `persona` | 是 | 1 到 2000 字 | 給對話模型的角色說明 |
 | `outfit` | 否 | 1 到 16 字，不能有換行或方括號 | 只顯示在設定清單，寫成「小花（制服）」，用來分辨同一個角色的不同衣服 |
 | `greeting` | 否 | 最多 200 字，不能有方括號 | 桌寵啟動和換成她的時候說一次 |
 | `voice` | 否 | 只能寫 `"voice.wav"`，資料夾裡要真的有這個檔 | 她的聲音，見第 7 節 |
@@ -182,7 +193,7 @@ $work = "$env:USERPROFILE\aimate-art\hana"
 - 檔案太大。上限是每張 PNG 16 MB、每份 JSON 1 MB（`fillers.json` 8 MB）、`voice.wav` 10 MB、整個資料夾 200 MB。
 - 資料夾裡有捷徑（symlink 或 junction）。桌寵為了安全不跟隨捷徑，整個角色都不載入。
 
-角色資料夾可能是別人做的、從網路下載的，所以桌寵只讀資料夾第一層的 PNG、JSON 和 WAV，每個檔案都檢查大小。「個性」的文字會交給 Claude，但對話核心的 Claude 沒有任何工具，碰不到你的檔案。
+角色資料夾可能是別人做的、從網路下載的，所以桌寵只讀資料夾第一層的 PNG、JSON 和 WAV，每個檔案都檢查大小。「個性」的文字會交給你選的對話模型。她自己沒有任何工具，碰不到你的檔案。
 
 ## 9. 介面主題
 
@@ -208,11 +219,11 @@ $work = "$env:USERPROFILE\aimate-art\hana"
 | --- | --- | --- | --- |
 | `name` | 是 | 1 到 32 字 | 設定的「外觀」分頁 |
 | `colors.accent` | 是 | `#rrggbb` | 滑過和輸入時的框線。她的名字是 accent 往 ink 調 40% |
-| `colors.paper` | 是 | `#rrggbb` | 對話框、選項、對話紀錄的底色 |
+| `colors.paper` | 是 | `#rrggbb` | 對話框、選項、對話紀錄和設定視窗的底色 |
 | `colors.ink` | 是 | `#rrggbb` | 字的顏色 |
 | `colors.border` | 是 | `#rrggbb` | 所有框線 |
-| `colors.controls` | 是 | `#rrggbb` | 按鈕列、輸入框、麥克風按鈕的底色 |
-| `radius` | 是 | 0 到 28 的整數，單位 px | 對話框的圓角 |
+| `colors.controls` | 是 | `#rrggbb` | 按鈕列、輸入框、麥克風按鈕，以及設定視窗裡按鈕和欄位的底色 |
+| `radius` | 是 | 0 到 28 的整數，單位 px | 對話框和設定視窗的圓角 |
 | `icon` | 否 | 資料夾裡的一個 `.svg` 或 `.png` | 對話框裡她名字旁邊的小圖示 |
 | `paper_texture` | 否 | 資料夾裡的一個 `.svg` 或 `.png` | 鋪在底色上的紋理 |
 
