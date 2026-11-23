@@ -82,7 +82,7 @@ pub struct Settings {
     pub switches: Switches,
     pub speech: Speech,
     pub stt: SttPack,
-    pub chat_model: ChatModel,
+    pub chat: Chat,
     pub look: Look,
     /// The settings window's tab it was last on, so it opens there again. Here and not in the
     /// webview's storage, which lives under the AppData the Claude desktop app redirects.
@@ -153,9 +153,30 @@ pub struct SttPack {
     pub pack: String,
 }
 
+/// Who answers her (Docs/DESIGN_Settings.md 4): `claude` through the CLI the user is signed in to,
+/// or any OpenAI-compatible service at an address, Ollama on this machine first among them. Tagged
+/// like `Speech`, so a service without an address or a model cannot be built.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Chat {
+    Claude {
+        model: ClaudeModel,
+    },
+    Openai {
+        url: String,
+        model: String,
+        /// The NAME of the variable that holds the key, as for speech. `None` for a service that
+        /// takes none, which is every local one.
+        key_env: Option<String>,
+    },
+}
+
+/// The address the settings window offers first: Ollama on this machine.
+pub const OLLAMA_URL: &str = "http://127.0.0.1:11434/v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ChatModel {
+pub enum ClaudeModel {
     Haiku,
     Sonnet,
 }
@@ -180,7 +201,7 @@ impl Default for Settings {
             switches: Switches { voice: true, fillers: true, mic: true, follow: true, on_top: true, autostart: false },
             speech: Speech::Local,
             stt: SttPack { pack: DEFAULT_PACK.to_string() },
-            chat_model: ChatModel::Haiku,
+            chat: Chat::Claude { model: ClaudeModel::Haiku },
             look: Look { bubble_opacity: BUBBLE_OPACITY.default, font_size: FONT_SIZE.default as u32, theme: default_theme() },
             settings_tab: Tab::Character,
         }
@@ -290,7 +311,7 @@ impl<'a> Reader<'a> {
     /// The objects the design nests fields under. One that is there and is not an object is
     /// reported once here, and every field under it then reads as absent.
     fn objects(&mut self) {
-        for key in ["scale", "switches", "speech", "stt", "look"] {
+        for key in ["scale", "switches", "speech", "stt", "chat", "look"] {
             match self.root.get(key).filter(|v| !v.is_null()) {
                 Some(v) if !v.is_object() => self.problem(key, format!("{v} 不是物件，裡面每一項都用預設值")),
                 None if self.mode == Mode::Request => self.problem(key, "沒有給這一項"),
@@ -310,23 +331,7 @@ impl<'a> Reader<'a> {
                 let url = self.checked("speech.url", check_url);
                 let model = self.checked("speech.model", |s| check_name("模型", s));
                 let voice = self.checked("speech.voice", |s| check_name("聲音", s));
-                // Optional in both modes: a local service needs no key, and the window sends an
-                // empty name or `null` for none.
-                let key_env = match self.root.pointer("/speech/key_env").filter(|v| !v.is_null()) {
-                    None => None,
-                    Some(Value::String(s)) if s.is_empty() => None,
-                    Some(Value::String(s)) => match check_env_name(s) {
-                        Ok(()) => Some(s.clone()),
-                        Err(why) => {
-                            self.problem("speech.key_env", why);
-                            None
-                        }
-                    },
-                    Some(v) => {
-                        self.problem("speech.key_env", format!("{v} 不是文字"));
-                        None
-                    }
-                };
+                let key_env = self.key_env("speech.key_env");
                 match (url, model, voice) {
                     (Some(url), Some(model), Some(voice)) if self.problems.len() == before => {
                         Speech::Custom { url, model, voice, key_env }
@@ -343,6 +348,81 @@ impl<'a> Reader<'a> {
             other => {
                 self.problem("speech.kind", format!("{other:?} 不是 local 或 custom，改用本機"));
                 Speech::Local
+            }
+        }
+    }
+
+    /// A key's variable name. Optional in both modes: a local service needs no key, and the window
+    /// sends an empty name or `null` for none.
+    fn key_env(&mut self, field: &str) -> Option<String> {
+        match self.root.pointer(&format!("/{}", field.replace('.', "/"))).filter(|v| !v.is_null()) {
+            None => None,
+            Some(Value::String(s)) if s.is_empty() => None,
+            Some(Value::String(s)) => match check_env_name(s) {
+                Ok(()) => Some(s.clone()),
+                Err(why) => {
+                    self.problem(field, why);
+                    None
+                }
+            },
+            Some(v) => {
+                self.problem(field, format!("{v} 不是文字"));
+                None
+            }
+        }
+    }
+
+    /// Who answers her. A file written before `chat` existed has `chat_model` instead, which is
+    /// read as the `claude` model it named; the next save writes `chat`.
+    fn chat(&mut self) -> Chat {
+        let fallback = Chat::Claude { model: ClaudeModel::Haiku };
+        let given = self.root.get("chat").is_some_and(|v| !v.is_null());
+        if !given && self.mode == Mode::File {
+            return Chat::Claude { model: self.legacy_chat_model() };
+        }
+        let Some(kind) = self.text("chat.kind") else {
+            return fallback;
+        };
+        match kind {
+            "claude" => match self.text("chat.model") {
+                None => fallback,
+                Some(name) => match ClaudeModel::ALL.into_iter().find(|m| m.name() == name) {
+                    Some(model) => Chat::Claude { model },
+                    None => {
+                        self.problem("chat.model", format!("{name:?} 不是 haiku 或 sonnet，改用 haiku"));
+                        fallback
+                    }
+                },
+            },
+            "openai" => {
+                let before = self.problems.len();
+                let url = self.checked("chat.url", check_url);
+                let model = self.checked("chat.model", |s| check_name("模型", s));
+                let key_env = self.key_env("chat.key_env");
+                match (url, model) {
+                    (Some(url), Some(model)) if self.problems.len() == before => Chat::Openai { url, model, key_env },
+                    _ => {
+                        if self.mode == Mode::File {
+                            self.problem("chat", "自訂聊天服務的設定不完整，改用 Claude Haiku");
+                        }
+                        fallback
+                    }
+                }
+            }
+            other => {
+                self.problem("chat.kind", format!("{other:?} 不是 claude 或 openai，改用 Claude Haiku"));
+                fallback
+            }
+        }
+    }
+
+    fn legacy_chat_model(&mut self) -> ClaudeModel {
+        match self.text("chat_model") {
+            None | Some("haiku") => ClaudeModel::Haiku,
+            Some("sonnet") => ClaudeModel::Sonnet,
+            Some(other) => {
+                self.problem("chat_model", format!("{other:?} 不是 haiku 或 sonnet，改用 haiku"));
+                ClaudeModel::Haiku
             }
         }
     }
@@ -401,17 +481,6 @@ impl<'a> Reader<'a> {
             Some(p) => {
                 self.problem("stt.pack", format!("{p:?} 不是模型包的名稱，改用 SenseVoice"));
                 DEFAULT_PACK.to_string()
-            }
-        }
-    }
-
-    fn chat_model(&mut self) -> ChatModel {
-        match self.text("chat_model") {
-            None | Some("haiku") => ChatModel::Haiku,
-            Some("sonnet") => ChatModel::Sonnet,
-            Some(other) => {
-                self.problem("chat_model", format!("{other:?} 不是 haiku 或 sonnet，改用 haiku"));
-                ChatModel::Haiku
             }
         }
     }
@@ -478,7 +547,7 @@ impl Settings {
             },
             speech: r.speech(),
             stt: SttPack { pack: r.pack() },
-            chat_model: r.chat_model(),
+            chat: r.chat(),
             look: Look { bubble_opacity: r.number(BUBBLE_OPACITY), font_size: r.number(FONT_SIZE) as u32, theme: r.theme() },
             settings_tab: r.tab(),
         };
@@ -490,14 +559,15 @@ impl Settings {
     }
 }
 
-/// `https` anywhere, `http` only to this machine (Docs/DESIGN_Settings.md 4): what she says goes to
-/// this address, and in the clear only when it never leaves the computer. No `@`, because a URL
-/// that carries credentials puts a secret in the file, and `http://127.0.0.1@elsewhere` is not
-/// local whatever it starts with.
+/// `https` anywhere, `http` only to this machine (Docs/DESIGN_Settings.md 4): what she and the user
+/// say goes to this address, and in the clear only when it never leaves the computer. No `@`,
+/// because a URL that carries credentials puts a secret in the file, and
+/// `http://127.0.0.1@elsewhere` is not local whatever it starts with.
 ///
-/// The core reads this address again when it starts (`speech_url` in ChatCore/src/voice.rs) and
-/// refuses what it does not take, and then every sentence is silent. So these rules are the core's,
-/// not looser: a lower-case scheme, the loopback literals and not `localhost`, no query or fragment.
+/// The core reads the speech and the chat address again when it starts (`endpoint` in
+/// ChatCore/src/voice.rs) and refuses what it does not take, and then every sentence is silent or
+/// unanswered. So these rules are the core's, not looser: a lower-case scheme, the loopback literals
+/// and not `localhost`, no query or fragment.
 pub fn check_url(url: &str) -> Result<(), String> {
     if url.len() > 2048 || url.chars().any(|c| c.is_whitespace() || c.is_control()) || url.contains(['?', '#']) {
         return Err("網址太長，或有空白、控制字元、? 或 #".to_string());
@@ -723,8 +793,8 @@ pub fn window_rect(position: (i32, i32), size: (u32, u32), factor: f64, monitor:
 }
 
 /// Why each child process must start again after `before` became `after`, or `None` for one that
-/// keeps running (Docs/DESIGN_Settings.md 4). The core reads her voice service and her model only
-/// when it starts, and the speech input service its pack, so a change reaches them only this way.
+/// keeps running (Docs/DESIGN_Settings.md 4). The core reads her voice service and who answers her
+/// only when it starts, and the speech input service its pack, so a change reaches them only this way.
 /// The reason is what the page says while she is quiet.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Restarts {
@@ -734,8 +804,8 @@ pub struct Restarts {
 
 pub fn restarts(before: &Settings, after: &Settings) -> Restarts {
     let mut core = Vec::new();
-    if before.chat_model != after.chat_model {
-        core.push(format!("對話模型換成 {}", after.chat_model.name()));
+    if before.chat != after.chat {
+        core.push(format!("對話模型換成 {}", after.chat.label()));
     }
     if before.speech != after.speech {
         core.push(match &after.speech {
@@ -747,12 +817,24 @@ pub fn restarts(before: &Settings, after: &Settings) -> Restarts {
     Restarts { core: (!core.is_empty()).then(|| core.join("，")), stt }
 }
 
-impl ChatModel {
+impl ClaudeModel {
+    pub const ALL: [ClaudeModel; 2] = [ClaudeModel::Haiku, ClaudeModel::Sonnet];
+
     /// Its name on the wire, in the file, and in `VRCHATCORE_MODEL`.
     pub fn name(self) -> &'static str {
         match self {
-            ChatModel::Haiku => "haiku",
-            ChatModel::Sonnet => "sonnet",
+            ClaudeModel::Haiku => "haiku",
+            ClaudeModel::Sonnet => "sonnet",
+        }
+    }
+}
+
+impl Chat {
+    /// What the page says she is changing to, and what the log names.
+    pub fn label(&self) -> String {
+        match self {
+            Chat::Claude { model } => format!("Claude {}", model.name()),
+            Chat::Openai { url, model, .. } => format!("{model}（{url}）"),
         }
     }
 }

@@ -16,10 +16,13 @@
 //!   loudness value per 320 samples, the shape of one entry in `voice/fillers.json`; or
 //!   `{"state":"silent","why"}`, a sentence the bubble can show as it is.
 //! - `{"ev":"turn_end"}` after each turn, and `{"ev":"error","message"}` when a turn failed.
+//! - `relay_asked`, `relay_step` and `relayed`, the relay's three events, which go to `relay.rs` and
+//!   not to the page. That file restates them.
 //!
-//! The pet writes three lines: `{"op":"say","text"}`, `{"op":"character","name","persona","voice"?}`
-//! once as each core starts and again on each change of character, and `{"op":"greet","text"}`,
-//! which the core voices like a turn of one part with no tags.
+//! The pet writes four lines: `{"op":"say","text"}`, `{"op":"character","name","persona","voice"?}`
+//! once as each core starts and again on each change of character, `{"op":"greet","text"}`,
+//! which the core voices like a turn of one part with no tags, and `{"op":"relay","nonce","title",
+//! "body","summary"}`, one per approved relay. The core is started as `serve --relay` for the last.
 //!
 //! A voiced line is a few hundred kilobytes (about 430 KB of base64 for ten seconds of speech). It
 //! is relayed like any other line, whole, with one field added on the way (`for_page`): a voiced
@@ -53,6 +56,7 @@ use vrcue::Bindings;
 use crate::cast;
 use crate::child::{self, Piped, Reaper};
 use crate::cue::{plan, profile};
+use crate::relay;
 use crate::settings;
 use crate::voice;
 
@@ -133,6 +137,18 @@ pub fn character_line(speaking: &cast::Speaking) -> String {
 /// The line that has her say `text` in her current voice without asking the model.
 pub fn greet_line(text: &str) -> String {
     framed(json!({ "op": "greet", "text": text }))
+}
+
+/// The line that hands the core one approved relay. The body goes as the user approved it, header
+/// included, and the summary is the same for every relay.
+pub fn relay_line(order: &relay::Order) -> String {
+    framed(json!({
+        "op": "relay",
+        "nonce": order.nonce.as_str(),
+        "title": order.title,
+        "body": order.body.as_str(),
+        "summary": relay::SUMMARY,
+    }))
 }
 
 fn framed(line: Value) -> String {
@@ -269,6 +285,12 @@ pub fn locate(tried: &[PathBuf], exists: impl Fn(&Path) -> bool) -> Result<PathB
 
 /// The model `claude` runs on (ChatCore/src/serve.rs).
 pub const MODEL_ENV: &str = "VRCHATCORE_MODEL";
+/// Who answers her, and where (ChatCore/src/chat.rs). `ENGINE_ENV` is set only for the HTTP engine:
+/// left out, the core runs `claude`, and says so in the bubble when it cannot be found.
+pub const ENGINE_ENV: &str = "VRCHATCORE_ENGINE";
+pub const CHAT_URL_ENV: &str = "VRCHATCORE_CHAT_URL";
+pub const CHAT_MODEL_ENV: &str = "VRCHATCORE_CHAT_MODEL";
+pub const CHAT_KEY_ENV_ENV: &str = "VRCHATCORE_CHAT_KEY_ENV";
 /// Her voice service (ChatCore/src/voice.rs). `KEY_ENV` carries the name of the variable that holds
 /// the key and never the key: the core reads the value itself, from the environment it inherits.
 pub const SPEECH_URL_ENV: &str = "VRCHATCORE_SPEECH_URL";
@@ -279,20 +301,68 @@ pub const SPEECH_KEY_ENV_ENV: &str = "VRCHATCORE_SPEECH_KEY_ENV";
 /// The environment a core starts with under `settings`: each variable set to a value, or `None` to
 /// remove it. Removed and not left alone, so a local voice is local whatever the shell that started
 /// the pet had set, and switching back from a custom service leaves nothing of it behind.
-pub fn env(settings: &settings::Settings) -> [(&'static str, Option<String>); 5] {
+pub fn env(settings: &settings::Settings) -> [(&'static str, Option<String>); 9] {
     let (url, model, voice, key_env) = match &settings.speech {
         settings::Speech::Local => (None, None, None, None),
         settings::Speech::Custom { url, model, voice, key_env } => {
             (Some(url.clone()), Some(model.clone()), Some(voice.clone()), key_env.clone())
         }
     };
+    let (claude_model, engine, chat_url, chat_model, chat_key_env) = match &settings.chat {
+        settings::Chat::Claude { model } => (Some(model.name().to_string()), None, None, None, None),
+        settings::Chat::Openai { url, model, key_env } => {
+            (None, Some("openai".to_string()), Some(url.clone()), Some(model.clone()), key_env.clone())
+        }
+    };
     [
-        (MODEL_ENV, Some(settings.chat_model.name().to_string())),
+        (MODEL_ENV, claude_model),
+        (ENGINE_ENV, engine),
+        (CHAT_URL_ENV, chat_url),
+        (CHAT_MODEL_ENV, chat_model),
+        (CHAT_KEY_ENV_ENV, chat_key_env),
         (SPEECH_URL_ENV, url),
         (SPEECH_MODEL_ENV, model),
         (SPEECH_VOICE_ENV, voice),
         (SPEECH_KEY_ENV_ENV, key_env),
     ]
+}
+
+/// What `vrchatcore models` printed: `{"models":[...]}`, or `{"error":"..."}` with the reason the
+/// settings window shows as it is.
+pub fn models_line(stdout: &[u8]) -> Result<Vec<String>, String> {
+    let line: Value = serde_json::from_slice(stdout.trim_ascii())
+        .map_err(|e| format!("對話核心列模型時印了讀不懂的東西：{e}"))?;
+    if let Some(why) = line.get("error").and_then(Value::as_str) {
+        return Err(why.to_string());
+    }
+    let names = line.get("models").and_then(Value::as_array).ok_or("對話核心列模型時沒有給清單")?;
+    Ok(names.iter().filter_map(Value::as_str).map(str::to_string).collect())
+}
+
+/// The models the service at `url` has, asked by the core and not by the page: the core holds the
+/// address rules and reads the key, so the settings window never reaches the service and never
+/// sees a key. Blocks for as long as the core takes, which its own timeout bounds at ten seconds.
+pub fn list_models(url: &str, key_env: Option<&str>) -> Result<Vec<String>, String> {
+    settings::check_url(url)?;
+    if let Some(name) = key_env {
+        settings::check_env_name(name)?;
+    }
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let exe = locate(&candidates(std::env::var_os(EXE_ENV), exe_dir.as_deref(), !cfg!(debug_assertions)), Path::is_file)?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("models").env(CHAT_URL_ENV, url).stdin(Stdio::null());
+    match key_env {
+        Some(name) => cmd.env(CHAT_KEY_ENV_ENV, name),
+        None => cmd.env_remove(CHAT_KEY_ENV_ENV),
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().map_err(|e| format!("對話核心 {} 起不來：{e}", exe.display()))?;
+    models_line(&out.stdout)
 }
 
 /// Why the core is gone, in the words the bubble will say.
@@ -340,6 +410,12 @@ impl Core {
         self.write(&greet_line(text))
     }
 
+    /// Hands the core one approved relay. An `Err` means the line never reached it, so nothing was
+    /// sent.
+    pub fn relay(&self, order: &relay::Order) -> Result<(), String> {
+        self.write(&relay_line(order))
+    }
+
     /// One whole line, under the lock, so two lines written at once cannot interleave.
     fn write(&self, line: &str) -> Result<(), String> {
         let mut pipe = self.piped.stdin();
@@ -355,10 +431,15 @@ impl Core {
 }
 
 /// Records the state and tells the page. The lock is gone before the emit, like `follow_bubble_side`.
+/// A core that is down or restarting takes any relay in flight with it, and nobody can say whether
+/// that one was sent.
 fn set_state(app: &AppHandle, next: CoreState) {
     *app.state::<Core>().state.lock().expect("core state poisoned") = next.clone();
     if let Err(e) = app.emit(STATE_EVENT, &next) {
         eprintln!("emit {STATE_EVENT}: {e}");
+    }
+    if let CoreState::Down { why } | CoreState::Restarting { why } = &next {
+        relay::core_gone(app, why);
     }
 }
 
@@ -377,7 +458,7 @@ fn launch(app: &AppHandle) -> Result<(), String> {
     let exe = locate(&tried, Path::is_file)?;
 
     let mut cmd = Command::new(&exe);
-    cmd.arg("serve").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg("serve").arg("--relay").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // Without this a GUI build flashes a console window when the core starts.
     #[cfg(windows)]
     {
@@ -385,9 +466,9 @@ fn launch(app: &AppHandle) -> Result<(), String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    // The settings as they are now, read at each start: this is the only way a change of model or
+    // The settings as they are now, read at each start: this is the only way a change of chat or
     // voice service reaches the core. The log names the variables and not their values beyond the
-    // model and the address, and no value here is ever a key.
+    // models and the addresses, and no value here is ever a key.
     let settings = app.state::<settings::Store>().current();
     let mut set = Vec::new();
     for (name, value) in env(&settings) {
@@ -405,7 +486,7 @@ fn launch(app: &AppHandle) -> Result<(), String> {
         settings::Speech::Local => "local".to_string(),
         settings::Speech::Custom { url, .. } => url.clone(),
     };
-    eprintln!("core: starting with model {}, speech {speech}, setting {}", settings.chat_model.name(), set.join(" "));
+    eprintln!("core: starting with chat {}, speech {speech}, setting {}", settings.chat.label(), set.join(" "));
     let mut child = cmd.spawn().map_err(|e| format!("對話核心 {} 起不來：{e}", exe.display()))?;
 
     let (Some(mut stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
@@ -470,6 +551,10 @@ fn read_stdout(app: &AppHandle, stdout: ChildStdout, reaper: Reaper) {
         let next = app.state::<Core>().state().after(&event);
         if let Some(next) = next {
             set_state(app, next);
+        }
+        if let Some(from) = relay::from_core(&event) {
+            relay::take(app, from);
+            return;
         }
         let event = for_page(event, bindings);
         if let Some(why) = event.pointer("/plan/error").and_then(Value::as_str) {

@@ -30,6 +30,7 @@ mod fleet;
 mod hit;
 mod home;
 mod press;
+mod relay;
 mod selftest;
 mod settings;
 mod stt;
@@ -66,6 +67,9 @@ struct Session {
     waiting_since: Option<u128>,
     #[serde(default, skip_deserializing)]
     waiting_message: Option<String>,
+    /// Not from the CLI either: the user's pin (`fleet::pins`). Set when the rows are listed.
+    #[serde(default, skip_deserializing)]
+    pinned: bool,
 }
 
 /// What `vrpet-hook set` left behind, keyed by session id.
@@ -137,14 +141,18 @@ fn run_json(exe: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The user's sessions, in the order the list shows them (`fleet::shown`): the CLI's rows with the
+/// pet's own conversation engine taken out, each marked waiting from the hook's alerts and pinned from
+/// `pins.json`.
 #[tauri::command]
-fn fleet() -> Result<Vec<Session>, String> {
+fn fleet(pins: tauri::State<'_, fleet::pins::Pins>) -> Result<Vec<Session>, String> {
     let mut last = String::new();
     for exe in claude_candidates() {
         match run_json(&exe, &["agents", "--json"]) {
             Ok(text) => {
                 let mut sessions =
                     serde_json::from_str::<Vec<Session>>(&text).map_err(|e| format!("parse: {e}"))?;
+                sessions.retain(|s| !fleet::is_pet_engine(&s.cwd));
                 let alerts = read_alerts();
                 for s in &mut sessions {
                     // A busy session is working, so it is not waiting on anyone whatever the
@@ -158,12 +166,49 @@ fn fleet() -> Result<Vec<Session>, String> {
                         s.waiting_message = msg.as_deref().and_then(fleet::asking_line);
                     }
                 }
-                return Ok(sessions);
+                return Ok(pins.show(sessions));
             }
             Err(e) => last = e,
         }
     }
     Err(last)
+}
+
+/// Pins or unpins one session and answers the list as it stands now, so the row moves at the click
+/// and not at the next poll. Idempotent (`fleet::pins::change`). Only the pet's window may ask.
+#[tauri::command]
+fn pin_session(pins: tauri::State<'_, fleet::pins::Pins>, session_id: String, pinned: bool) -> Result<Vec<Session>, String> {
+    pins.set(&session_id, pinned)
+}
+
+/// The relay as it stands, for the page to ask once when it loads, for the reason `core_state` gives.
+#[tauri::command]
+fn relay_state(relays: tauri::State<'_, relay::Relays>) -> relay::View {
+    relays.view()
+}
+
+/// A row's 轉話: opens the sheet on that session with an empty field. The session list is read again
+/// here, so the sheet shows the row as it is now. `async` because reading it runs the CLI.
+#[tauri::command]
+async fn relay_open(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
+    let fleet = fleet(app.state());
+    app.state::<relay::Relays>().apply(&app, relay::Input::Opened { session_id, fleet })
+}
+
+/// 送出 and 再送一次, and nothing else: the only command that can start a send, and the page calls it
+/// only from those two clicks. The text is the field's at the click, so what the user edited is what
+/// is framed and sent. The list is read again, so a row that went or was renamed since the sheet
+/// opened is refused and redrawn rather than sent to.
+#[tauri::command]
+async fn relay_approve(app: tauri::AppHandle, revision: u64, session_id: String, text: String) -> Result<(), String> {
+    let fleet = fleet(app.state());
+    app.state::<relay::Relays>().approve(&app, revision, session_id, text, fleet)
+}
+
+/// 取消 on a draft, 關閉 on an outcome.
+#[tauri::command]
+fn relay_dismiss(app: tauri::AppHandle, relays: tauri::State<'_, relay::Relays>, revision: u64) -> Result<(), String> {
+    relays.apply(&app, relay::Input::Dismiss { revision })
 }
 
 /// The page's own answers, printed once on stdout. A spike's job is to answer questions, and a
@@ -510,6 +555,13 @@ async fn stt_packs() -> Result<Vec<stt::Pack>, String> {
     stt::packs()
 }
 
+/// The models the chat service at `url` has, for the settings window's model list (`core::list_models`).
+/// `async` because the core is started for it and may wait on the service for seconds.
+#[tauri::command]
+async fn chat_models(url: String, key_env: Option<String>) -> Result<Vec<String>, String> {
+    core::list_models(&url, key_env.as_deref().filter(|k| !k.is_empty()))
+}
+
 /// The settings in effect and what was wrong with the file they came from. The pet's page asks once
 /// when it loads, for the reason `core_state` gives, and the settings window asks to fill its form.
 ///
@@ -731,6 +783,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
         OVERLAY,
         &[
             "fleet",
+            "pin_session",
             "set_regions",
             "report",
             "save_shot",
@@ -746,6 +799,10 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "get_settings",
             "open_settings",
             "themes",
+            "relay_state",
+            "relay_open",
+            "relay_approve",
+            "relay_dismiss",
             cast::SCHEME,
             themes::SCHEME,
         ],
@@ -762,6 +819,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "save_profile",
             "copy_character",
             "stt_packs",
+            "chat_models",
             "themes",
             "open_themes_folder",
             themes::SCHEME,
@@ -840,7 +898,10 @@ fn main() {
     }
     tauri::Builder::default()
         .manage(Mutex::new(hit::Regions::default()))
+        // Here and not in `setup`, so the page's first poll can never find it missing.
+        .manage(fleet::pins::Pins::open(home::dir().ok()))
         .manage(core::Core::default())
+        .manage(relay::Relays::default())
         .manage(stt::Stt::default())
         .manage(press::Held::default())
         // Which filler plays next. An integer and not a shuffled bag, because `voice::pick` is
@@ -874,6 +935,7 @@ fn main() {
             let commands: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
                 Box::new(tauri::generate_handler![
                     fleet,
+                    pin_session,
                     set_regions,
                     report,
                     save_shot,
@@ -895,8 +957,13 @@ fn main() {
                     save_profile,
                     copy_character,
                     stt_packs,
+                    chat_models,
                     themes,
-                    open_themes_folder
+                    open_themes_folder,
+                    relay_state,
+                    relay_open,
+                    relay_approve,
+                    relay_dismiss
                 ]);
             move |invoke| match refuse(invoke.message.webview_ref().label(), invoke.message.command()) {
                 // `true` is "answered". The refusal reaches the caller as the command's error, and

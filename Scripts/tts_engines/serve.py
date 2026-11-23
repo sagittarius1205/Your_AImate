@@ -25,7 +25,12 @@ cannot point the model at an arbitrary file.
 import argparse, io, json, os, re, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import soundfile as sf
+# torch's allocator on Windows (mimalloc) keeps the CPU memory that loading the model frees: about
+# 11 GB of commit for as long as the service runs. Purging at once gives it back, and synthesis is
+# no slower (Docs/MEASURE_Hardware.md). torch reads this when it loads, so it is set before that.
+os.environ.setdefault("MIMALLOC_PURGE_DELAY", "0")
+
+import soundfile as sf  # noqa: E402
 
 WORK = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, WORK)

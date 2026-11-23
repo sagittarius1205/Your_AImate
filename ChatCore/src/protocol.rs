@@ -2,6 +2,7 @@
 // may ever be written to stdout.
 
 use crate::character::{Character, Greeting};
+use crate::relay::{self, Nonce, Order};
 use crate::voice::Voice;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,11 @@ pub enum Request {
     Character(Character),
     /// Voiced in the current voice without asking the model.
     Greet(Greeting),
+    /// Deliver one approved message. Answered by exactly one `relayed`.
+    Relay(Order),
+    /// A `relay` whose nonce can be read and whose other fields break a limit. It is still
+    /// answered by one `relayed`, so the client is not left waiting for it.
+    UnfitRelay { nonce: Nonce, why: String },
     Shutdown,
 }
 
@@ -27,6 +33,7 @@ enum Wire {
     Say { text: String },
     Character { name: String, persona: String, voice: Option<String> },
     Greet { text: String },
+    Relay { nonce: String, title: String, body: String, summary: String },
     Shutdown,
 }
 
@@ -38,6 +45,13 @@ impl TryFrom<Wire> for Request {
             Wire::Say { text } => Request::Say { text },
             Wire::Character { name, persona, voice } => Request::Character(Character::new(&name, &persona, voice.as_deref())?),
             Wire::Greet { text } => Request::Greet(Greeting::new(&text)?),
+            Wire::Relay { nonce, title, body, summary } => {
+                let nonce = Nonce::new(&nonce)?;
+                match Order::new(nonce.clone(), &title, &body, &summary) {
+                    Ok(order) => Request::Relay(order),
+                    Err(why) => Request::UnfitRelay { nonce, why },
+                }
+            }
             Wire::Shutdown => Request::Shutdown,
         })
     }
@@ -52,6 +66,20 @@ pub enum Event {
     Utterance { part: usize, text: String, tags: Vec<String>, voice: Voice },
     TurnEnd,
     Error { message: String },
+    /// She asked for a relay, in the user's words. Nothing she wrote this turn is said, and
+    /// `turn_end` follows.
+    RelayAsked { to: String, text: String },
+    /// The courier moved on. `handing` carries the address and is sent before the message is
+    /// given to the courier's model, so a client that loses the core after it knows a send may
+    /// have begun.
+    RelayStep {
+        nonce: Nonce,
+        #[serde(flatten)]
+        step: relay::Step,
+    },
+    /// How one `relay` ended. `gated` is false only when a send succeeded that the gate did not let
+    /// through.
+    Relayed { nonce: Nonce, outcome: relay::Outcome, gated: bool, elapsed_ms: u64, cost_usd: Option<f64> },
 }
 
 /// Bytes, not `&str`, so a line that is not UTF-8 is a malformed line like any other and not a

@@ -10,7 +10,7 @@
 // `answer` turns that into a `Reply` through the checks in `reply.rs`.
 
 use crate::character::Character;
-use crate::reply::{self, Reply};
+use crate::reply::{self, Relaying, Reply};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -41,6 +41,15 @@ const LEAVE_GRACE: Duration = Duration::from_millis(400);
 /// The last lines of stderr kept for the error message when the process dies.
 const STDERR_KEPT: usize = 6;
 
+/// The variable Claude Desktop sets on what it starts, to say which program started it. A
+/// `claude -p` that inherits `claude-desktop` ends every turn with an extra `system/post_turn_summary`
+/// step of 2.3 to 2.8 s. Measured 2026-11-13 (claude 2.1.309, haiku): the same core relayed in 9.7 s
+/// when it inherited a Claude Desktop session's environment and in 4.2 s from a clean one, and with
+/// the whole inherited environment kept and only this variable removed the step was gone. Only this
+/// one is removed: the user may have signed `claude` in through other `CLAUDE_CODE_*` or
+/// `ANTHROPIC_*` variables, which it needs.
+const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
+
 /// Where to look for `claude`, best first. PATH first, because that is what the user's own shell
 /// uses; the known install location is the fallback for an app started from Explorer, which does
 /// not always inherit the same PATH (the shape of `claude_candidates()` in the pet's `main.rs`).
@@ -58,13 +67,13 @@ pub fn candidates(explicit: Option<OsString>, home: Option<OsString>) -> Vec<OsS
 
 /// The command that starts the engine, not yet started. Separate from `start` so a test can read
 /// what would run (the program, the flags, the directory) without running anything.
-pub fn command(program: &OsStr, cwd: &Path, model: &str, character: &Character) -> Command {
+pub fn command(program: &OsStr, cwd: &Path, model: &str, character: &Character, relaying: Relaying) -> Command {
     let mut cmd = Command::new(program);
     cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
         .arg("--json-schema")
-        .arg(reply::schema().to_string())
+        .arg(reply::schema(relaying).to_string())
         .arg("--append-system-prompt")
-        .arg(reply::prompt(character))
+        .arg(reply::prompt(character, relaying))
         .arg("--model")
         .arg(model)
         // Three flags that together leave the character nothing but this conversation. `--tools ""`
@@ -141,7 +150,7 @@ pub fn classify(line: &[u8]) -> Line {
 }
 
 /// The `result` message as a `Reply`: the first decode, then the checks in `reply::parse`.
-pub fn answer(message: &Value) -> Result<Reply, String> {
+pub fn answer(message: &Value, relaying: Relaying) -> Result<Reply, String> {
     let subtype = message.get("subtype").and_then(Value::as_str);
     let flagged = message.get("is_error").and_then(Value::as_bool).unwrap_or(false);
     if flagged || subtype.is_some_and(|s| s != "success") {
@@ -153,7 +162,7 @@ pub fn answer(message: &Value) -> Result<Reply, String> {
         return Err(format!("claude reported an error{which}: {}", reply::excerpt(&said)));
     }
     match message.get("result") {
-        Some(Value::String(text)) => reply::parse(text),
+        Some(Value::String(text)) => reply::parse(text, relaying),
         Some(other) => Err(format!("claude's result is {}, not a string", reply::kind(other))),
         None => Err("claude's result message has no `result` field".to_string()),
     }
@@ -163,6 +172,8 @@ pub fn answer(message: &Value) -> Result<Reply, String> {
 pub enum Msg {
     Result(Value),
     Bad(String),
+    /// A line as it came, from a process started with `Lines::All`.
+    Raw(Vec<u8>),
     /// The pipe closed (`None`) or failed to read (`Some`).
     Ended(Option<String>),
 }
@@ -191,7 +202,7 @@ pub fn await_result(msgs: &Receiver<Msg>, limit: Duration, stop: &AtomicBool) ->
             Ok(Msg::Result(value)) => return Ok(value),
             Ok(Msg::Bad(why)) => return Err(Wait::Bad(why)),
             Ok(Msg::Ended(why)) => return Err(Wait::Ended(why)),
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(Msg::Raw(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Err(Wait::Ended(None)),
         }
     }
@@ -230,19 +241,35 @@ pub struct Proc {
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
-/// Starts the first candidate that exists. A program that is not there moves on to the next place;
-/// any other failure to start is remembered, and is what is reported if nothing starts. The
-/// variable `withheld` names is not passed on: it holds the speech service's API key, and `claude`
-/// has no use for it.
-pub fn start(candidates: &[OsString], cwd: &Path, model: &str, character: &Character, withheld: Option<&OsStr>) -> Result<Proc, StartError> {
+/// What the reader hands over from stdout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Lines {
+    /// The character's process: only what ends a turn, and what breaks the stream.
+    Answers,
+    /// The courier's: every line, for the caller to read itself.
+    All,
+}
+
+/// The character's process.
+pub fn start(candidates: &[OsString], cwd: &Path, model: &str, character: &Character, relaying: Relaying, withheld: &[&OsStr]) -> Result<Proc, StartError> {
+    spawn(candidates, cwd, withheld, Lines::Answers, |program| command(program, cwd, model, character, relaying))
+}
+
+/// Starts the first candidate that exists, with the command `make` builds for it. A program that
+/// is not there moves on to the next place; any other failure to start is remembered, and is what
+/// is reported if nothing starts. The variables `withheld` names are not passed on: they hold the
+/// API keys of the speech and chat services, and `claude` has no use for them. Nor is
+/// `ENTRYPOINT_ENV`, whoever the caller is.
+pub fn spawn(candidates: &[OsString], cwd: &Path, withheld: &[&OsStr], lines: Lines, make: impl Fn(&OsStr) -> Command) -> Result<Proc, StartError> {
     let mut failed = None;
     for program in candidates {
-        let mut cmd = command(program, cwd, model, character);
-        if let Some(name) = withheld {
+        let mut cmd = make(program);
+        cmd.env_remove(ENTRYPOINT_ENV);
+        for name in withheld {
             cmd.env_remove(name);
         }
         match cmd.spawn() {
-            Ok(child) => return Ok(Proc::attach(child, cwd)),
+            Ok(child) => return Ok(Proc::attach(child, cwd, lines)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => failed = failed.or_else(|| Some(format!("{}: {e}", program.to_string_lossy()))),
         }
@@ -254,14 +281,17 @@ pub fn start(candidates: &[OsString], cwd: &Path, model: &str, character: &Chara
 }
 
 impl Proc {
-    fn attach(mut child: Child, cwd: &Path) -> Proc {
+    fn attach(mut child: Child, cwd: &Path, lines: Lines) -> Proc {
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
         let (tx, msgs) = mpsc::channel();
         let started = Instant::now();
         let cwd = cwd.to_path_buf();
-        thread::spawn(move || read_stdout(stdout, tx, started, &cwd));
+        thread::spawn(move || match lines {
+            Lines::Answers => read_stdout(stdout, tx, started, &cwd),
+            Lines::All => forward_stdout(stdout, &tx),
+        });
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
         let tail = Arc::clone(&stderr_tail);
         thread::spawn(move || read_stderr(stderr, &tail));
@@ -273,15 +303,39 @@ impl Proc {
         self.child.try_wait().ok().flatten()
     }
 
-    /// Hands over one sentence and waits for the `result` message that answers it.
-    pub fn ask(&mut self, text: &str, limit: Duration, stop: &AtomicBool) -> Result<Value, Failure> {
+    /// Hands over one sentence as a user message.
+    pub fn write(&mut self, text: &str) -> Result<(), String> {
         let wrote = match self.stdin.as_mut() {
             Some(stdin) => stdin.write_all(user_line(text).as_bytes()).and_then(|()| stdin.flush()),
             None => Err(std::io::Error::other("its input is closed")),
         };
-        if let Err(e) = wrote {
-            return Err(Failure::Broken(self.death_note(Some(format!("writing to it failed: {e}")))));
+        wrote.map_err(|e| self.death_note(Some(format!("writing to it failed: {e}"))))
+    }
+
+    /// The next line from a process started with `Lines::All`, by `deadline`, unless the core is
+    /// shutting down first.
+    pub fn next_line(&self, deadline: Instant, stop: &AtomicBool) -> Result<Vec<u8>, Wait> {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Err(Wait::Stopped);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Wait::Timeout);
+            }
+            match self.msgs.recv_timeout(left.min(POLL)) {
+                Ok(Msg::Raw(line)) => return Ok(line),
+                Ok(Msg::Bad(why)) => return Err(Wait::Bad(why)),
+                Ok(Msg::Ended(why)) => return Err(Wait::Ended(why)),
+                Ok(Msg::Result(_)) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Err(Wait::Ended(None)),
+            }
         }
+    }
+
+    /// Hands over one sentence and waits for the `result` message that answers it.
+    pub fn ask(&mut self, text: &str, limit: Duration, stop: &AtomicBool) -> Result<Value, Failure> {
+        self.write(text).map_err(Failure::Broken)?;
         match await_result(&self.msgs, limit, stop) {
             Ok(message) => Ok(message),
             Err(Wait::Stopped) => Err(Failure::Stopped),
@@ -295,7 +349,7 @@ impl Proc {
 
     /// Why the process is gone, for the person who just asked it something: the exit code when it
     /// has one, and the last thing it said on stderr.
-    fn death_note(&mut self, detail: Option<String>) -> String {
+    pub fn death_note(&mut self, detail: Option<String>) -> String {
         let deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {
             if let Some(status) = self.exited() {
@@ -319,6 +373,13 @@ impl Proc {
             note.push_str(&format!(". What it last said on stderr: {tail}"));
         }
         note
+    }
+
+    /// Ends the process now and waits until it is gone. For a caller that is about to decide
+    /// something from what the process did, and must not have it do more first.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     /// Lets the process leave by closing its input, and kills it if it has not gone shortly after.
@@ -366,6 +427,23 @@ fn read_stdout(stdout: ChildStdout, tx: Sender<Msg>, started: Instant, cwd: &Pat
                 }
                 Line::Other => continue,
             },
+        };
+        let last = matches!(msg, Msg::Ended(_));
+        if tx.send(msg).is_err() || last {
+            return;
+        }
+    }
+}
+
+/// Reads stdout to its end and hands over every line as it came.
+fn forward_stdout(stdout: ChildStdout, tx: &Sender<Msg>) {
+    let mut input = BufReader::new(stdout);
+    loop {
+        let mut buf = Vec::new();
+        let msg = match input.read_until(b'\n', &mut buf) {
+            Ok(0) => Msg::Ended(None),
+            Err(e) => Msg::Ended(Some(e.to_string())),
+            Ok(_) => Msg::Raw(buf),
         };
         let last = matches!(msg, Msg::Ended(_));
         if tx.send(msg).is_err() || last {

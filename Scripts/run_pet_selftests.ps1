@@ -2,10 +2,12 @@
 # UnrealEditor.exe -VRSelfTest=<name> and its list has never had a pet_* in it, so until now
 # nothing ran these five together and the only way to check them was to remember all the names.
 #
-# usage: pwsh -File Scripts\run_pet_selftests.ps1 [-Tests page,hit] [-Release]
+# usage: pwsh -File Scripts\run_pet_selftests.ps1 [-Tests page,hit] [-Release] [-TargetDir <dir>]
+# -TargetDir is the CARGO_TARGET_DIR the pet was built into, for a build kept apart from target.
 param(
-    [string[]]$Tests = @("pet_vocab", "pet_page", "pet_hit", "pet_asking", "pet_cues", "pet_core", "pet_filler", "pet_mouth", "pet_gesture", "pet_mic", "pet_characters", "pet_settings", "pet_themes"),
-    [switch]$Release
+    [string[]]$Tests = @("pet_vocab", "pet_page", "pet_hit", "pet_asking", "pet_fleet", "pet_cues", "pet_core", "pet_filler", "pet_mouth", "pet_gesture", "pet_mic", "pet_characters", "pet_settings", "pet_themes", "pet_relay"),
+    [switch]$Release,
+    [string]$TargetDir = (Join-Path $PSScriptRoot "..\Pet\src-tauri\target")
 )
 
 $ErrorActionPreference = "Continue"
@@ -13,7 +15,7 @@ $ErrorActionPreference = "Continue"
 $Tests = $Tests -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 
 $profileDir = if ($Release) { "release" } else { "debug" }
-$exe = Join-Path $PSScriptRoot "..\Pet\src-tauri\target\$profileDir\vrpet.exe"
+$exe = Join-Path $TargetDir "$profileDir\vrpet.exe"
 if (-not (Test-Path $exe)) {
     Write-Output "SelfTest: FAIL run_pet_selftests: no binary at $exe. Build it with: cd Pet\src-tauri; cargo build"
     exit 2

@@ -20,6 +20,7 @@ from psd_tools import PSDImage
 from psd_tools.api.layers import PixelLayer
 
 from cut import PALETTE, clean_partmap, master_alpha
+from eyemap import EYE_PALETTE
 
 ID = {name: i for i, name in enumerate(PALETTE)}
 
@@ -69,8 +70,14 @@ def split_lr(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return left, right
 
 
+# The white and the iris from eyemap.png, for a face whose eyes the colours below miss (eyemap.py).
+EYEMAP: tuple[np.ndarray, np.ndarray] | None = None
+
+
 def eye_colours(master: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """The white of the eye (pale, unsaturated) and the bright orange of the iris."""
+    if EYEMAP is not None:
+        return EYEMAP
     hsv = cv2.cvtColor(np.ascontiguousarray(master[..., :3]), cv2.COLOR_RGB2HSV_FULL).astype(int)
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     return (s < 70) & (v > 150), (h >= 10) & (h <= 42) & (s > 110) & (v > 140)
@@ -179,6 +186,19 @@ def main(work: Path) -> None:
     labels = clean_partmap(np.array(Image.open(work / "partmap.png").convert("RGB").resize(master.shape[1::-1], Image.NEAREST)))
     is_ = lambda *names: np.isin(labels, [ID[n] for n in names])
     report = []
+
+    if (work / "eyemap.png").exists():
+        global EYEMAP
+        em = np.array(Image.open(work / "eyemap.png").convert("RGB")).astype(int)
+        colour = lambda c: (em == EYE_PALETTE[c]).all(axis=2)
+        white, iris = colour("white"), colour("iris")
+        eyes = white | iris | colour("lash")
+        # The eye map replaces the part map's eyes; what the part map called eye and the map does not
+        # is face skin.
+        labels[is_("eyes") & ~eyes] = ID["face"]
+        labels[eyes] = ID["eyes"]
+        EYEMAP = (white, iris)
+        report.append(f"eyes from eyemap.png: white {int(white.sum())} px, iris {int(iris.sum())} px, lashes {int(colour('lash').sum())} px")
 
     # What each edit was told not to touch, used to measure and undo any drift.
     lower = is_("skirt", "legs")

@@ -7,3 +7,6 @@
 # The pet binds its gestures to the figure by a hash of rig.json's bytes (Pet/src-tauri/src/cue/profile.rs),
 # so git has to hand those files back byte for byte on every checkout, whatever core.autocrlf says.
 Pet/ui/characters/**/*.json -text
+
+# cmd.exe mis-parses blocks and labels in a batch file that has bare LF line ends.
+*.bat text eol=crlf

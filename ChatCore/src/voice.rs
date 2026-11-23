@@ -346,7 +346,7 @@ impl Fault {
 
 /// `value` as a refusal may print it: without the user name and password of the address, and
 /// without a query or fragment, which are the two other places a key gets put by hand.
-fn shown(value: &str) -> String {
+pub(crate) fn shown(value: &str) -> String {
     let value = &value[..value.find(['?', '#']).unwrap_or(value.len())];
     // With no scheme it is not an address, and whatever it is stays unsaid.
     let Some((scheme, rest)) = value.split_once("://") else { return "不是網址".to_string() };
@@ -370,20 +370,29 @@ pub fn speech_url(base: Option<OsString>) -> Result<Endpoint, Fault> {
         return Ok(Endpoint { url: format!("{DEFAULT_BASE}/audio/speech"), tls: false, local: true });
     };
     let value = raw.to_string_lossy().into_owned();
-    let refuse = || Fault::BadUrl { value: shown(&value) };
-    let (tls, rest) = match (value.strip_prefix("https://"), value.strip_prefix("http://")) {
+    endpoint(&value, "/audio/speech").ok_or_else(|| Fault::BadUrl { value: shown(&value) })
+}
+
+/// `base` with `path` after it, when `base` is `https://` and any host, or plain `http://` on a
+/// loopback literal. The rule for every service the core sends words to, speech and chat alike.
+pub(crate) fn endpoint(base: &str, path: &str) -> Option<Endpoint> {
+    let (tls, rest) = match (base.strip_prefix("https://"), base.strip_prefix("http://")) {
         (Some(rest), _) => (true, rest),
         (_, Some(rest)) => (false, rest),
-        _ => return Err(refuse()),
+        _ => return None,
     };
-    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    let host = host_of(authority).ok_or_else(refuse)?;
+    let (authority, base_path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = host_of(authority)?;
     let local = matches!(host, "127.0.0.1" | "[::1]");
-    if (!tls && !local) || !path.is_ascii() || path.contains(['?', '#']) || path.contains(|c: char| c.is_whitespace() || c.is_control()) {
-        return Err(refuse());
+    if (!tls && !local)
+        || !base_path.is_ascii()
+        || base_path.contains(['?', '#'])
+        || base_path.contains(|c: char| c.is_whitespace() || c.is_control())
+    {
+        return None;
     }
     let scheme = if tls { "https" } else { "http" };
-    Ok(Endpoint { url: format!("{scheme}://{authority}{}/audio/speech", path.trim_end_matches('/')), tls, local })
+    Some(Endpoint { url: format!("{scheme}://{authority}{}{path}", base_path.trim_end_matches('/')), tls, local })
 }
 
 /// The host of `authority` (`host`, `host:port`, `[v6]` or `[v6]:port`) when all of it is well
@@ -433,12 +442,48 @@ impl SpeechEnv {
 
 /// The API key. `Debug` is written out so that nothing that prints a `Service`, in a test failure
 /// or a later log line, prints this.
-struct Key(String);
+pub(crate) struct Key(String);
 
 impl fmt::Debug for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Key(..)")
     }
+}
+
+impl Key {
+    /// The `Authorization` header's value, the one place the key is sent.
+    pub(crate) fn bearer(&self) -> String {
+        format!("Bearer {}", self.0)
+    }
+
+    /// `text` with the key in it replaced, for a service that explains a refusal by quoting the key
+    /// it was given. Before any cut, so a cut cannot leave half of it.
+    pub(crate) fn redact(&self, text: &str) -> String {
+        text.replace(&self.0, "***")
+    }
+}
+
+/// Why the variable a key is read from cannot give one.
+#[derive(Debug, PartialEq)]
+pub(crate) enum KeyFault {
+    /// Not a name of the shape `valid_key_env` accepts.
+    Name,
+    Missing(String),
+    Unusable(String),
+}
+
+/// The key in the variable `name` names, read through `lookup`.
+pub(crate) fn key_from(name: &OsStr, lookup: &dyn Fn(&str) -> Option<OsString>) -> Result<Key, KeyFault> {
+    let name = name.to_str().filter(|n| valid_key_env(n)).ok_or(KeyFault::Name)?;
+    let value = lookup(name).ok_or_else(|| KeyFault::Missing(name.to_string()))?;
+    let value = value.to_str().ok_or_else(|| KeyFault::Unusable(name.to_string()))?.trim();
+    if value.is_empty() {
+        return Err(KeyFault::Missing(name.to_string()));
+    }
+    if !value.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err(KeyFault::Unusable(name.to_string()));
+    }
+    Ok(Key(value.to_string()))
 }
 
 /// A name for a variable that holds a key: the shape environment variables conventionally have.
@@ -452,11 +497,15 @@ fn valid_key_env(name: &str) -> bool {
         && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// A model or voice name a service is sent as given: 1 to `NAME_MAX` letters, digits and `. _ - : /`.
+pub(crate) fn is_name(value: &str) -> bool {
+    (1..=NAME_MAX).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_:/".contains(&b))
+}
+
 /// A `model` or `voice` sent as given: a name and not text.
 fn name_of(env: &'static str, value: Option<&OsString>) -> Result<Option<String>, Fault> {
     let Some(value) = value.filter(|v| !v.is_empty()) else { return Ok(None) };
-    let ok = value.to_str().filter(|v| v.len() <= NAME_MAX && v.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_:/".contains(&b)));
-    ok.map(|v| Some(v.to_string())).ok_or(Fault::BadName { env })
+    value.to_str().filter(|v| is_name(v)).map(|v| Some(v.to_string())).ok_or(Fault::BadName { env })
 }
 
 /// Everything a request needs from the environment, checked.
@@ -490,18 +539,11 @@ impl Service {
         }
         let key = match env.key_env.as_ref().filter(|v| !v.is_empty()) {
             None => None,
-            Some(name) => {
-                let name = name.to_str().filter(|n| valid_key_env(n)).ok_or(Fault::KeyEnvName)?;
-                let value = lookup(name).ok_or_else(|| Fault::KeyMissing { name: name.to_string() })?;
-                let value = value.to_str().ok_or_else(|| Fault::KeyUnusable { name: name.to_string() })?.trim();
-                if value.is_empty() {
-                    return Err(Fault::KeyMissing { name: name.to_string() });
-                }
-                if !value.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-                    return Err(Fault::KeyUnusable { name: name.to_string() });
-                }
-                Some(Key(value.to_string()))
-            }
+            Some(name) => Some(key_from(name, lookup).map_err(|fault| match fault {
+                KeyFault::Name => Fault::KeyEnvName,
+                KeyFault::Missing(name) => Fault::KeyMissing { name },
+                KeyFault::Unusable(name) => Fault::KeyUnusable { name },
+            })?),
         };
         Ok(Service { endpoint, model, voice, key })
     }
@@ -513,7 +555,7 @@ impl Service {
         Request {
             url: self.endpoint.url.clone(),
             body: json!({ "model": self.model, "input": text, "voice": voice, "response_format": "wav" }),
-            authorization: self.key.as_ref().map(|key| format!("Bearer {}", key.0)),
+            authorization: self.key.as_ref().map(Key::bearer),
         }
     }
 }
@@ -581,9 +623,7 @@ impl Speaker {
         let bytes = response.body_mut().read_to_vec().map_err(fault)?;
         if code != 200 {
             let said = String::from_utf8_lossy(&bytes).into_owned();
-            // A service that explains a refusal by quoting the key it was given would otherwise
-            // put the key in the bubble. Before the cut, so a cut cannot leave half of it.
-            let said = service.key.as_ref().map_or(said.clone(), |key| said.replace(&key.0, "***"));
+            let said = service.key.as_ref().map_or(said.clone(), |key| key.redact(&said));
             return Err(Fault::Status { code, said: said.chars().take(120).collect() });
         }
         let pcm = pcm_of_wav(&bytes).map_err(Fault::Incompatible)?;

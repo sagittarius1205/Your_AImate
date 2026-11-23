@@ -128,11 +128,40 @@ fn passthrough(pcm: &[i16]) -> Frames16k {
     b.push(Pcm::I16(pcm))
 }
 
+/// Reports speech only once it has heard `lag_ms` of it, so every onset is that late. Silero does
+/// this on a soft first syllable: its first voiced frame came 460 to 1200 ms after the sound began
+/// on the synthesised `嗨，我在這裡。` (Docs/DESIGN_STT.md 7.7).
+struct LateVad {
+    lag_frames: usize,
+    run: usize,
+}
+
+impl LateVad {
+    fn new(lag_ms: u32) -> Self {
+        LateVad { lag_frames: (lag_ms as usize * SAMPLE_RATE as usize / 1000) / FRAME, run: 0 }
+    }
+}
+
+impl Vad for LateVad {
+    fn voiced(&mut self, frame: &[i16]) -> bool {
+        self.run = if frame[0] != 0 { self.run + 1 } else { 0 };
+        self.run > self.lag_frames
+    }
+
+    fn reset(&mut self) {
+        self.run = 0;
+    }
+}
+
 fn segment_all(cfg: SegmenterConfig, audio: &Frames16k, chunk: usize) -> (Vec<Frames16k>, Heard) {
+    segment_with(cfg, audio, chunk, &mut MaskVad)
+}
+
+fn segment_with(cfg: SegmenterConfig, audio: &Frames16k, chunk: usize, vad: &mut dyn Vad) -> (Vec<Frames16k>, Heard) {
     let mut seg = Segmenter::new(cfg);
     let mut out = Vec::new();
     for piece in audio.samples().chunks(chunk.max(1)) {
-        out.extend(seg.push(&passthrough(piece), &mut MaskVad));
+        out.extend(seg.push(&passthrough(piece), vad));
     }
     let (last, heard) = seg.close();
     out.extend(last);
@@ -150,14 +179,15 @@ fn loud_ms(f: &Frames16k) -> u64 {
 fn segmenter(c: &mut Checks) {
     let cfg = SegmenterConfig::default();
 
-    // Leading and trailing silence trimmed to the pads: 300 ms before, 200 ms after.
-    let (segs, heard) = segment_all(cfg, &script(&[(false, 1000), (true, 1000), (false, 1000)]), 777);
+    // Leading and trailing silence trimmed to the pads: `pad_pre_ms` before, 200 ms after.
+    let pre = u64::from(cfg.pad_pre_ms);
+    let (segs, heard) = segment_all(cfg, &script(&[(false, 3000), (true, 1000), (false, 1000)]), 777);
     c.eq(segs.len(), 1, "one second of speech in silence is one segment");
     c.eq(heard, Heard::Speech, "and the press heard speech");
     if let Some(s) = segs.first() {
-        c.eq(ms_of(s), 300 + 1000 + 200, "trimmed to pre pad + speech + post pad");
+        c.eq(ms_of(s), pre + 1000 + 200, "trimmed to pre pad + speech + post pad");
         c.eq(loud_ms(s), 1000, "with all of the speech in it");
-        c.that(s.samples()[..300 * 16].iter().all(|&x| x == 0), "the pre pad is the silence before");
+        c.that(s.samples()[..(pre * 16) as usize].iter().all(|&x| x == 0), "the pre pad is the silence before");
     }
 
     // A pause of exactly the split length cuts; one frame shorter does not.
@@ -187,6 +217,27 @@ fn segmenter(c: &mut Checks) {
     // Speech that starts in the first frame has no silence to pad with, and is not delayed.
     let (segs, _) = segment_all(cfg, &script(&[(true, 400)]), 123);
     c.eq(segs.first().map(ms_of), Some(400), "speech from the first frame, released at once, is all kept");
+
+    // A detector that is late must not cost the first word. The speech here starts in the first
+    // frame, the way it does when someone talks the moment the button goes down, and the detector
+    // calls it speech 900 ms in. Every sample of the sound has to reach the recogniser.
+    let (segs, _) = segment_with(cfg, &script(&[(true, 1500), (false, 1000)]), 777, &mut LateVad::new(900));
+    c.eq(segs.len(), 1, "speech from the first frame, heard 900 ms late, is one segment");
+    c.eq(segs.first().map(loud_ms), Some(1500), "and none of the 900 ms before the detector woke is dropped");
+
+    // The longest lag measured at the default settings was 1200 ms, after a short lead of silence.
+    let (segs, _) = segment_with(cfg, &script(&[(false, 100), (true, 1500), (false, 600)]), FRAME, &mut LateVad::new(1200));
+    c.eq(segs.first().map(loud_ms), Some(1500), "a 1200 ms onset lag after 100 ms of silence loses nothing");
+
+    // A late detector after a pause: each segment keeps its own speech and the two share no audio, so
+    // a pre pad longer than the pause leaves cannot play the same syllable twice.
+    let audio = script(&[(true, 800), (false, 800), (true, 800), (false, 200)]);
+    let (segs, _) = segment_with(cfg, &audio, 4096, &mut LateVad::new(600));
+    c.eq(segs.iter().map(loud_ms).collect::<Vec<_>>(), vec![800, 800], "two late onsets: all of each half is kept");
+    c.that(
+        segs.iter().map(Frames16k::len).sum::<usize>() <= audio.len(),
+        format!("and the segments are disjoint: {} samples out of {} in", segs.iter().map(Frames16k::len).sum::<usize>(), audio.len()),
+    );
 
     // How the audio arrives must not change where the cuts fall.
     let audio = script(&[(false, 450), (true, 620), (false, 900), (true, 260), (false, 120)]);

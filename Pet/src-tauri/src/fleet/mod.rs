@@ -1,6 +1,10 @@
-//! The gatekeeper's own data. Today only the one decision the roster row needs; `Roster`,
-//! `Coverage`, the join and the reaping move here from `main.rs` when that unit lands
-//! (Docs/DESIGN_Pet.md section 9).
+//! The gatekeeper's own data: what a row may say about what a session is asking, which sessions are
+//! the user's at all, and the order they are listed in. `Roster`, `Coverage`, the join and the reaping
+//! move here from `main.rs` when that unit lands (Docs/DESIGN_Pet.md section 9).
+
+use crate::Session;
+
+pub mod pins;
 
 /// How many characters of a notification a row may show.
 ///
@@ -65,4 +69,74 @@ pub fn asking_line(raw: &str) -> Option<String> {
         out.push('…');
     }
     Some(out)
+}
+
+/// The folder the pet's conversation core makes everything it runs under: `vrchatcore-<pid>` in the
+/// temp folder (ChatCore/src/scratch.rs, `Scratch::under`). `pet_fleet` reads that file and goes red
+/// when it stops spelling the name this way.
+const SCRATCH_PREFIX: &str = "vrchatcore-";
+
+/// Whether a session's working directory is one of the pet's own: anything under the core's scratch
+/// folder, which is its conversation engine and the relay's courier today.
+///
+/// Both are `claude` processes, so `claude agents --json` lists them like sessions the user started,
+/// under names the CLI makes up (`engine-dc`, `relay-probe2-f0`). They are not the user's, and
+/// "17 sessions" with one of them the pet's own mouth is a wrong count. What the core controls is the
+/// directory, so that is what is matched: any part of the path that is `vrchatcore-` and digits, in
+/// either slash and any case. The scratch folder's own name is matched and not what is inside it, so a
+/// third thing the core runs there is hidden without this changing. The folder above it is not
+/// compared with the temp folder, because a short 8.3 spelling of it would make this miss, and that
+/// mistake shows a row, where a stricter check could only hide one of the user's. A folder of the
+/// user's own called `vrchatcore-<digits>` is hidden too, which is the price.
+pub fn is_pet_engine(cwd: &str) -> bool {
+    cwd.split(['\\', '/']).any(|part| {
+        let part = part.to_ascii_lowercase();
+        part.strip_prefix(SCRATCH_PREFIX).is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// The four places a row can be listed, in the order they are listed. A waiting session is first
+/// because that is the product, and a pinned one is next because the user said it matters. A busy one
+/// is ahead of the rest because it is the other one doing something now. The derived `Ord` is the
+/// order, so a fifth group is one more variant and cannot be forgotten at a comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Group {
+    Waiting,
+    Pinned,
+    Busy,
+    Rest,
+}
+
+pub fn group(s: &Session) -> Group {
+    if s.waiting {
+        Group::Waiting
+    } else if s.pinned {
+        Group::Pinned
+    } else if s.status == "busy" {
+        Group::Busy
+    } else {
+        Group::Rest
+    }
+}
+
+/// Group by group, each newest first. Ties on the start time fall to the session id, so two polls of
+/// the same fleet list it the same way and a row does not swap places with its twin.
+pub fn order(rows: &mut [Session]) {
+    rows.sort_by(|a, b| group(a).cmp(&group(b)).then(b.started_at.cmp(&a.started_at)).then_with(|| a.session_id.cmp(&b.session_id)));
+}
+
+/// The rows as the page lists them: each marked pinned or not by `pinned`, and in order. The order is
+/// decided here and not in the page, for the reason the whole design gives: the page renders and
+/// does not decide, and a rule that lives in Rust can be run by `pet_fleet`.
+pub fn shown(polled: &[Session], pinned: &[String]) -> Vec<Session> {
+    let mut rows: Vec<Session> = polled
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            s.pinned = pinned.contains(&s.session_id);
+            s
+        })
+        .collect();
+    order(&mut rows);
+    rows
 }

@@ -7,6 +7,7 @@
 
 use crate::character::Character;
 use crate::protocol::Said;
+use crate::relay::Fact;
 use serde_json::{Value, json};
 
 /// The gestures a model may pick. Not every cue the pet can play: a beat, a two-handed beat and the
@@ -92,16 +93,33 @@ impl Gesture {
     }
 }
 
+/// The most clauses an answer may have. The schema asks for it and `parse` holds it, so the limit
+/// does not depend on whether the endpoint enforces `maxItems`.
+pub const MAX_CLAUSES: usize = 3;
+
+/// Whether this core offers the character a way to ask for a relay. Fixed for the life of the
+/// process the character runs in, because `claude` is started with the schema and the prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Relaying {
+    Off,
+    On,
+}
+
+pub const RELAY_TO_MAX: usize = 64;
+pub const RELAY_TEXT_MAX: usize = 1000;
+
 /// The shape handed to `--json-schema`. Built from `Gesture::ALL`, so the vocabulary the model is
-/// shown and the one the core accepts are one list.
-pub fn schema() -> Value {
-    json!({
+/// shown and the one the core accepts are one list. `Off` is the schema from before relaying, byte
+/// for byte, so the VR client sees no change. `On` adds `relay`, listed in `required` and nullable,
+/// because strict mode on the HTTP engine wants every property required.
+pub fn schema(relaying: Relaying) -> Value {
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "clauses": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 3,
+                "maxItems": MAX_CLAUSES,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -117,17 +135,54 @@ pub fn schema() -> Value {
         },
         "required": ["clauses", "language", "affect"],
         "additionalProperties": false,
-    })
+    });
+    if relaying == Relaying::On {
+        schema["properties"]["relay"] = json!({
+            "anyOf": [
+                { "type": "null" },
+                {
+                    "type": "object",
+                    "properties": { "to": { "type": "string" }, "text": { "type": "string" } },
+                    "required": ["to", "text"],
+                    "additionalProperties": false,
+                },
+            ],
+        });
+        schema["required"] = json!(["clauses", "language", "affect", "relay"]);
+    }
+    schema
 }
 
 /// The system prompt appended to the CLI's own: a sentence naming her, the profile's persona, and
 /// then the rules. The persona is the profile's to write and the rules are not, so it comes first
-/// and the rules have the last word.
-pub fn prompt(character: &Character) -> String {
+/// and the rules have the last word. Nothing here takes a session, so no session's title can reach
+/// the prompt.
+pub fn prompt(character: &Character, relaying: Relaying) -> String {
     let persona = character.persona().trim();
     // A persona that stops without a full stop would run into the first rule as one sentence.
     let stop = if persona.ends_with(['。', '！', '？', '…', '.', '!', '?']) { "" } else { "。" };
-    format!("你是一個桌面寵物角色，名字叫{}。{persona}{stop}{}", character.name(), rules())
+    let relay = if relaying == Relaying::On { RELAY_RULES } else { "" };
+    format!("你是一個桌面寵物角色，名字叫{}。{persona}{stop}{}{relay}", character.name(), rules())
+}
+
+/// What she is told about relaying when it is offered. She never sees a session: she writes the
+/// user's words for the target and the text, and the pet does the rest. Nothing she writes on a
+/// relay turn is said, so she cannot claim the delivery there, and she is told not to claim it
+/// anywhere else.
+const RELAY_RULES: &str = "你自己沒辦法傳話給其他 Claude session，也看不到有哪些 session。\
+使用者要你轉話給某個 session 時，relay 填 {to, text}：to 是他對那個 session 的叫法，照他說的寫，他沒說就留空；\
+text 是要轉過去的話，照他要轉的內容，用他的口吻和他說的語言寫，不要加他沒說的話。這一輪的 clauses 不會念出來，寫一句就好，桌寵會接手。\
+沒有要轉話的時候 relay 填 null。不要說你已經傳了、送了或轉達了，送沒送到只有桌寵知道，它會告訴使用者。\
+要送出一定要使用者在畫面上按「送出」，用說的不算。";
+
+/// The sentence put in front of the next thing the user says, so she knows how the last relay
+/// ended. Fixed words, with no title and no text from another session.
+pub fn note(fact: Fact) -> &'static str {
+    match fact {
+        Fact::Delivered => "（桌寵告訴你的，不是使用者說的：你上一次要轉的話已經放進對方 session 的收件匣，對方還沒讀，也可能不照做。）",
+        Fact::NotSent => "（桌寵告訴你的，不是使用者說的：你上一次要轉的話沒有送出。）",
+        Fact::Unknown => "（桌寵告訴你的，不是使用者說的：你上一次要轉的話送沒送到不確定。）",
+    }
 }
 
 /// What holds for every character: that she hears and speaks, how an answer is cut into clauses,
@@ -155,6 +210,26 @@ pub struct Clause {
 #[derive(Debug, PartialEq)]
 pub struct Reply {
     pub clauses: Vec<Clause>,
+    /// `Some` only when relaying is offered and she filled it.
+    pub relay: Option<RelayAsk>,
+}
+
+/// What she asked to have passed on, in the user's words. `to` may be empty, and it is never a
+/// title, because she never sees one. Made only by `parse`.
+#[derive(Debug, PartialEq)]
+pub struct RelayAsk {
+    to: String,
+    text: String,
+}
+
+impl RelayAsk {
+    pub fn to(&self) -> &str {
+        &self.to
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 impl Reply {
@@ -261,29 +336,60 @@ fn clause_atoms(clause: &Clause) -> Vec<Atom> {
 
 /// The second decode. `claude` hands over its answer as a string that holds the JSON, so this takes
 /// that string and not a value. Rejects the whole turn at the first clause that breaks a rule, and
-/// says which clause and which rule.
-pub fn parse(result: &str) -> Result<Reply, String> {
+/// says which clause and which rule. `Off` ignores a `relay` key, as `language` and `affect` are
+/// ignored. `On` reads it: null or absent is no relay, because an engine that ignores the schema
+/// leaves it out, and anything else has to be a relay that keeps its limits or the turn is refused.
+pub fn parse(result: &str, relaying: Relaying) -> Result<Reply, String> {
     let value: Value = serde_json::from_str(result)
-        .map_err(|e| format!("claude's result is not JSON ({e}): {}", excerpt(result)))?;
+        .map_err(|e| format!("the answer is not JSON ({e}): {}", excerpt(result)))?;
     let Value::Object(object) = &value else {
         return Err(format!(
-            "claude's result is JSON but not an object, it is {}: {}",
+            "the answer is JSON but not an object, it is {}: {}",
             kind(&value),
             excerpt(result)
         ));
     };
     let Some(Value::Array(clauses)) = object.get("clauses") else {
-        return Err(format!("claude's result has no `clauses` array: {}", excerpt(result)));
+        return Err(format!("the answer has no `clauses` array: {}", excerpt(result)));
     };
     if clauses.is_empty() {
-        return Err("claude's result has an empty `clauses` array, so there is nothing to say".to_string());
+        return Err("the answer has an empty `clauses` array, so there is nothing to say".to_string());
     }
-    clauses
-        .iter()
-        .enumerate()
-        .map(|(at, clause)| parse_clause(at, clause))
-        .collect::<Result<Vec<_>, _>>()
-        .map(|clauses| Reply { clauses })
+    if clauses.len() > MAX_CLAUSES {
+        return Err(format!("the answer has {} clauses, and an answer has at most {MAX_CLAUSES}", clauses.len()));
+    }
+    let clauses = clauses.iter().enumerate().map(|(at, clause)| parse_clause(at, clause)).collect::<Result<Vec<_>, _>>()?;
+    let relay = match (relaying, object.get("relay")) {
+        (Relaying::Off, _) | (Relaying::On, None | Some(Value::Null)) => None,
+        (Relaying::On, Some(value)) => Some(parse_relay(value)?),
+    };
+    Ok(Reply { clauses, relay })
+}
+
+fn parse_relay(value: &Value) -> Result<RelayAsk, String> {
+    let Value::Object(object) = value else {
+        return Err(format!("relay is {}, not an object or null", kind(value)));
+    };
+    let field = |name: &str| match object.get(name) {
+        Some(Value::String(text)) => Ok(text.trim().to_string()),
+        _ => Err(format!("relay.{name} is missing or not a string")),
+    };
+    let (to, text) = (field("to")?, field("text")?);
+    if to.chars().count() > RELAY_TO_MAX {
+        return Err(format!("relay.to is {} characters, and the limit is {RELAY_TO_MAX}", to.chars().count()));
+    }
+    if text.is_empty() {
+        return Err("relay.text is empty, so there is nothing to pass on".to_string());
+    }
+    if text.chars().count() > RELAY_TEXT_MAX {
+        return Err(format!("relay.text is {} characters, and the limit is {RELAY_TEXT_MAX}", text.chars().count()));
+    }
+    for (name, value, lines) in [("to", &to, false), ("text", &text, true)] {
+        if let Some(c) = value.chars().find(|&c| c.is_control() && !(lines && matches!(c, '\n' | '\t'))) {
+            return Err(format!("relay.{name} contains the control character {c:?}"));
+        }
+    }
+    Ok(RelayAsk { to, text })
 }
 
 fn parse_clause(at: usize, value: &Value) -> Result<Clause, String> {

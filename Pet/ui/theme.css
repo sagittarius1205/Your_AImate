@@ -1,0 +1,33 @@
+/* The interface theme (Docs/DESIGN_Themes.md), for every page that wears one: the pet's page and the
+   settings window. A theme is five colours, a radius and two pictures. These are the bundled 紙本,
+   which hold until `theme.js` has a theme from Rust to write over them, and which `theme.js` clears
+   back to when it is handed one it cannot wear. `pet_themes` checks them against `themes/paper/theme.json`,
+   so the page before Rust answers is the page after it. */
+:root {
+  --accent: #d97757;
+  --paper: #f3f2ef;
+  --ink: #2b2b2b;
+  --border: #cfc8bc;
+  --controls: #f3f2ef;
+  --radius: 18px;
+  --icon: url("themes/paper/icon.svg");
+  --paper-texture: url("themes/paper/paper.svg");
+
+  /* Mixed from the five, so that a theme recolours every one of them and none can be left behind.
+     Her name and every accent-coloured word are the accent toward the ink, which reads on a light
+     paper and a dark one alike. `--dim` is for small text that is not the point (a time, a note) and
+     `--faint` for marks that are not text at all (the placeholder, the arrow). */
+  --name: color-mix(in srgb, var(--accent) 60%, var(--ink));
+  --dim: color-mix(in srgb, var(--ink) 70%, var(--paper));
+  --faint: color-mix(in srgb, var(--ink) 40%, var(--paper));
+  --scroll: color-mix(in srgb, var(--ink) 30%, transparent);
+
+  /* The signals. A theme does not set these and cannot: something waiting for the user and something
+     that failed mean what they mean on any paper (Docs/DESIGN_Themes.md 2). The two `-text` colours
+     are the signal toward the ink, for words, and read at 4.5 to 1 or better on both bundled themes,
+     which `pet_themes` works out from this file. */
+  --wait: #c2410c;
+  --danger: #b91c1c;
+  --warn-text: color-mix(in srgb, var(--wait) 55%, var(--ink));
+  --error-text: color-mix(in srgb, var(--danger) 45%, var(--ink));
+}

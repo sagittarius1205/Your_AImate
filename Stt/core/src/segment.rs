@@ -17,6 +17,9 @@ pub trait Vad {
 /// Every value is a starting point to be measured on real speech (Docs/DESIGN_STT.md 2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmenterConfig {
+    /// How far before its first voiced frame a segment starts. This is the room the detector's onset
+    /// lag has to fit in: Silero called a soft first syllable voiced up to 1200 ms late, and audio it
+    /// had not yet called voiced is dropped from the segment (Docs/DESIGN_STT.md 7.7).
     pub pad_pre_ms: u32,
     pub pad_post_ms: u32,
     pub split_silence_ms: u32,
@@ -26,7 +29,7 @@ pub struct SegmenterConfig {
 
 impl Default for SegmenterConfig {
     fn default() -> Self {
-        SegmenterConfig { pad_pre_ms: 300, pad_post_ms: 200, split_silence_ms: 700, min_speech_ms: 150, max_segment_ms: 30_000 }
+        SegmenterConfig { pad_pre_ms: 1500, pad_post_ms: 200, split_silence_ms: 700, min_speech_ms: 150, max_segment_ms: 30_000 }
     }
 }
 
@@ -121,7 +124,8 @@ impl Segmenter {
 
         if b.silent_run >= frames_in(self.cfg.split_silence_ms) {
             let b = self.building.take()?;
-            let tail_from = b.voiced_end.min(b.samples.len());
+            // The finished segment ends `pad_post_ms` into this silence, so the next one starts after it.
+            let tail_from = (b.voiced_end + frames_in(self.cfg.pad_post_ms) * FRAME).min(b.samples.len());
             let keep = frames_in(self.cfg.pad_pre_ms) * FRAME;
             let tail = &b.samples[tail_from..];
             self.pre = tail[tail.len().saturating_sub(keep)..].iter().copied().collect();

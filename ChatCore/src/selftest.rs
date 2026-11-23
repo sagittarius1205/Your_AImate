@@ -9,6 +9,7 @@
 // Nothing here reaches the real speech service either. Every core is pointed at `FakeSpeech`, a
 // listener in this process that answers with a fixed clip, or at an address chosen for the failure
 // under test. A turn through the real service is seconds of GPU and a different answer each time.
+// The HTTP chat engine is pointed at `FakeChat` the same way, never at a real model.
 //
 // The transport check deliberately does not use `protocol`: it checks the wire against literal
 // JSON, not the structs that wrote it.
@@ -17,9 +18,12 @@
 // self-test that can only say "failed" costs a debugging session.
 
 use crate::character::{Character, DEFAULT_VOICE};
+use crate::chat;
 use crate::checks;
 use crate::claude;
+use crate::relay;
 use crate::reply;
+use crate::scratch;
 use crate::serve;
 use crate::stub;
 use crate::voice;
@@ -46,7 +50,15 @@ enum Mode {
     /// `claude` is nowhere to be found. With `required` the `claude` engine is asked for by name;
     /// without it nothing says which engine, so the core has to choose.
     Absent { required: bool },
+    /// The HTTP engine, sent to `url` and asked for `CHAT_MODEL`.
+    Openai { url: String },
+    /// `--relay`, with the stand-in as both the character and the courier. The courier does what
+    /// `behaviour` says (stub.rs), writes what it ran to `sent` and what it was told to `heard`.
+    Courier { log: PathBuf, sent: PathBuf, heard: PathBuf, behaviour: &'static str, step_ms: Option<u64> },
 }
+
+/// The model every core in `Mode::Openai` asks for.
+const CHAT_MODEL: &str = "selftest-model";
 
 struct Client {
     child: Child,
@@ -67,7 +79,7 @@ impl Client {
         let exe = std::env::current_exe().map_err(|e| format!("locating own executable: {e}"))?;
         let mut cmd = Command::new(&exe);
         cmd.arg("serve").env(voice::URL_ENV, speech_url);
-        for name in [voice::MODEL_ENV, voice::VOICE_ENV, voice::KEY_ENV_ENV] {
+        for name in [voice::MODEL_ENV, voice::VOICE_ENV, voice::KEY_ENV_ENV, chat::ENGINE_ENV, chat::URL_ENV, chat::MODEL_ENV, chat::KEY_ENV_ENV] {
             cmd.env_remove(name);
         }
         cmd.envs(env.iter().copied());
@@ -95,6 +107,25 @@ impl Client {
                 if *required {
                     cmd.args(["--engine", "claude"]);
                 }
+            }
+            Mode::Openai { url } => {
+                cmd.args(["--engine", "openai"]).env(chat::URL_ENV, url).env(chat::MODEL_ENV, CHAT_MODEL);
+            }
+            Mode::Courier { log: path, sent, heard, behaviour, step_ms } => {
+                for file in [path, sent, heard] {
+                    let _ = std::fs::remove_file(file);
+                }
+                cmd.args(["--engine", "claude", "--relay"])
+                    .env(claude::EXE_ENV, &exe)
+                    .env(stub::LOG_ENV, path)
+                    .env(stub::SENT_ENV, sent)
+                    .env(stub::HEARD_ENV, heard)
+                    .env(stub::COURIER_ENV, behaviour)
+                    .env_remove(serve::MODEL_ENV);
+                if let Some(ms) = step_ms {
+                    cmd.args(["--relay-step-ms", &ms.to_string()]);
+                }
+                log = Some(path.clone());
             }
         }
         let mut child = cmd
@@ -451,6 +482,45 @@ const SCENARIOS: &[Scenario] = &[
     ("a_greeting_with_no_speech_service_is_silent_and_still_ends_the_turn", a_greeting_with_no_speech_service_is_silent_and_still_ends_the_turn),
     ("a_bad_greeting_is_an_error_and_says_nothing", a_bad_greeting_is_an_error_and_says_nothing),
     ("a_character_and_a_greeting_wait_for_the_turn_in_flight", a_character_and_a_greeting_wait_for_the_turn_in_flight),
+    ("an_openai_answer_reaches_the_wire_with_its_gestures_as_tags", an_openai_answer_reaches_the_wire_with_its_gestures_as_tags),
+    ("an_openai_answer_the_core_refuses_is_named_and_not_remembered", an_openai_answer_the_core_refuses_is_named_and_not_remembered),
+    ("an_openai_service_that_is_not_running_is_named", an_openai_service_that_is_not_running_is_named),
+    ("the_history_sent_is_the_last_eight_turns", the_history_sent_is_the_last_eight_turns),
+    ("a_new_character_starts_the_history_over", a_new_character_starts_the_history_over),
+    ("the_chat_key_is_a_header_and_never_a_word_anyone_reads", the_chat_key_is_a_header_and_never_a_word_anyone_reads),
+    ("claude_is_started_without_the_chat_key", claude_is_started_without_the_chat_key),
+    ("a_chat_turn_ends_at_its_limit_or_at_a_stop", a_chat_turn_ends_at_its_limit_or_at_a_stop),
+    ("a_chat_turn_in_flight_does_not_keep_the_core_from_leaving", a_chat_turn_in_flight_does_not_keep_the_core_from_leaving),
+    ("the_models_are_listed_for_the_settings_window", the_models_are_listed_for_the_settings_window),
+    ("a_faithful_courier_delivers_once", a_faithful_courier_delivers_once),
+    ("a_courier_that_rewrites_the_text_sends_nothing", a_courier_that_rewrites_the_text_sends_nothing),
+    ("a_message_that_says_send_it_elsewhere_goes_nowhere_else", a_message_that_says_send_it_elsewhere_goes_nowhere_else),
+    ("a_courier_that_calls_twice_sends_once", a_courier_that_calls_twice_sends_once),
+    ("a_courier_whose_stop_hook_does_not_run_still_delivers", a_courier_whose_stop_hook_does_not_run_still_delivers),
+    ("a_courier_that_reaches_for_another_tool_gets_none", a_courier_that_reaches_for_another_tool_gets_none),
+    ("a_title_that_forges_a_line_reaches_nobody", a_title_that_forges_a_line_reaches_nobody),
+    ("a_session_that_is_gone_is_not_found", a_session_that_is_gone_is_not_found),
+    ("two_sessions_with_one_title_are_ambiguous", two_sessions_with_one_title_are_ambiguous),
+    ("a_gate_that_does_not_run_stops_before_anything_can_be_sent", a_gate_that_does_not_run_stops_before_anything_can_be_sent),
+    ("a_courier_that_dies_or_hangs_is_judged_by_where_it_stopped", a_courier_that_dies_or_hangs_is_judged_by_where_it_stopped),
+    ("the_same_order_twice_is_delivered_once", the_same_order_twice_is_delivered_once),
+    ("an_order_while_one_runs_is_busy", an_order_while_one_runs_is_busy),
+    ("a_relay_ask_turn_has_no_utterance", a_relay_ask_turn_has_no_utterance),
+    ("relaying_is_off_unless_serve_is_told", relaying_is_off_unless_serve_is_told),
+    ("an_order_that_breaks_a_limit_is_still_answered", an_order_that_breaks_a_limit_is_still_answered),
+    ("the_next_sentence_carries_the_last_outcome_once", the_next_sentence_carries_the_last_outcome_once),
+    ("an_outcome_outlives_a_sentence_that_was_not_answered", an_outcome_outlives_a_sentence_that_was_not_answered),
+    ("the_courier_runs_without_the_speech_and_chat_keys", the_courier_runs_without_the_speech_and_chat_keys),
+    ("the_courier_is_started_with_the_pinned_flags_intact", the_courier_is_started_with_the_pinned_flags_intact),
+    ("the_courier_and_its_folder_are_gone_after_shutdown", the_courier_and_its_folder_are_gone_after_shutdown),
+    ("she_answers_while_a_relay_runs", she_answers_while_a_relay_runs),
+    ("a_send_the_gate_never_saw_is_reported_as_it_was", a_send_the_gate_never_saw_is_reported_as_it_was),
+    ("the_gate_process_lets_one_of_four_racing_sends_through", the_gate_process_lets_one_of_four_racing_sends_through),
+    ("the_stop_hook_process_prints_the_stop_line", the_stop_hook_process_prints_the_stop_line),
+    ("the_stand_in_courier_ends_a_turn_where_its_stop_hook_says", the_stand_in_courier_ends_a_turn_where_its_stop_hook_says),
+    ("claude_children_do_not_inherit_the_hosts_entrypoint", claude_children_do_not_inherit_the_hosts_entrypoint),
+    ("the_outcome_goes_out_before_the_courier_and_its_folder_are_gone", the_outcome_goes_out_before_the_courier_and_its_folder_are_gone),
+    ("a_courier_that_times_out_cannot_send_after_the_outcome", a_courier_that_times_out_cannot_send_after_the_outcome),
 ];
 
 fn transport_with_the_echo_engine() -> Result<String, String> {
@@ -630,10 +700,10 @@ fn claude_is_started_with_the_measured_flags_intact() -> Result<String, String> 
         }
         // The two long values cross a Windows command line. Quotes and CJK must come out the other end intact.
         let schema: Option<Value> = after("--json-schema").and_then(|s| serde_json::from_str(s).ok());
-        if schema != Some(reply::schema()) {
+        if schema != Some(reply::schema(reply::Relaying::Off)) {
             return Err(format!("--json-schema arrived as {:?}, not as the schema", after("--json-schema")));
         }
-        if after("--append-system-prompt") != Some(&reply::prompt(&Character::standard())) {
+        if after("--append-system-prompt") != Some(&reply::prompt(&Character::standard(), reply::Relaying::Off)) {
             return Err("--append-system-prompt did not arrive as the default character's prompt".to_string());
         }
         client.shutdown()?;
@@ -660,11 +730,12 @@ fn a_claude_answer_reaches_the_wire_with_its_gestures_as_tags() -> Result<String
         client.say("ok")?;
         client.expect_turn("a two-clause answer", "[nod]收到 [offer]我在這裡", json!(["nod", "offer"]))?;
         client.say("many")?;
-        // Four one-syllable clauses. Three play 0.63 s and the fourth takes 0.38 s, so the pace sends
-        // the fourth as a part of its own; each part lists only its own tags.
+        // Four one-syllable atoms, the last two one clause cut after its comma. Three play 0.63 s and
+        // the fourth takes 0.38 s, so the pace sends the fourth as a part of its own; each part lists
+        // only its own tags, and a part that starts inside a clause has none.
         client.expect_parts(
-            "four clauses, a gesture used twice and one with none",
-            &[("[nod]一 二 [nod]三", json!(["nod"])), ("[think]四", json!(["think"]))],
+            "three clauses, a gesture used twice and one with none",
+            &[("[nod]一 二 [nod]三，", json!(["nod"])), ("四", json!([]))],
         )?;
         // A sentence goes through two JSON layers each way. The framing must survive what it holds.
         let awkward = "first line\nsecond \"quoted\" line \\ backslash\ttab and 日本語 😀";
@@ -712,6 +783,7 @@ fn a_gesture_outside_the_vocabulary_rejects_the_turn() -> Result<String, String>
 fn an_undecodable_claude_result_is_an_error_and_the_process_stays() -> Result<String, String> {
     with_stub("undecodable", |client| {
         rejected_and_carried_on(client, "empty", &["empty `clauses`"])?;
+        rejected_and_carried_on(client, "four", &["4 clauses", "at most 3"])?;
         rejected_and_carried_on(client, "notjson", &["not JSON", "this is not json"])?;
         rejected_and_carried_on(client, "array", &["JSON but not an object", "an array"])?;
         rejected_and_carried_on(client, "error", &["claude reported an error", "error_during_execution", "the stub failed on purpose"])?;
@@ -1302,7 +1374,7 @@ fn prompt_of(start: &Value) -> Option<String> {
 fn a_new_prompt_restarts_claude_and_a_new_voice_alone_does_not() -> Result<String, String> {
     with_stub("character", |client| {
         let first = client.wait_for_start(1)?;
-        if prompt_of(&first) != Some(reply::prompt(&Character::standard())) {
+        if prompt_of(&first) != Some(reply::prompt(&Character::standard(), reply::Relaying::Off)) {
             return Err(format!("before any character is sent she is 小克, the stand-in was started with {:?}", prompt_of(&first)));
         }
 
@@ -1311,7 +1383,7 @@ fn a_new_prompt_restarts_claude_and_a_new_voice_alone_does_not() -> Result<Strin
         let flower = Character::new("阿花", persona, None)?;
         client.character("阿花", persona, None)?;
         let second = client.wait_for_start(2)?;
-        if prompt_of(&second) != Some(reply::prompt(&flower)) {
+        if prompt_of(&second) != Some(reply::prompt(&flower, reply::Relaying::Off)) {
             return Err(format!("the second claude should be started with 阿花's prompt, it was started with {:?}", prompt_of(&second)));
         }
         wait_gone(pid_of(&first)?).map_err(|e| format!("the claude of the character before was left running: {e}"))?;
@@ -1330,7 +1402,7 @@ fn a_new_prompt_restarts_claude_and_a_new_voice_alone_does_not() -> Result<Strin
         // Back to the default prompt is a change of prompt like any other.
         client.character("小克", "你住在使用者的桌面角落，講話短、口語，預設用繁體中文，對方用別的語言就用那個語言。", None)?;
         let third = client.wait_for_start(3)?;
-        if prompt_of(&third) != Some(reply::prompt(&Character::standard())) {
+        if prompt_of(&third) != Some(reply::prompt(&Character::standard(), reply::Relaying::Off)) {
             return Err(format!("the third claude should be 小克's again, it was started with {:?}", prompt_of(&third)));
         }
 
@@ -1338,7 +1410,7 @@ fn a_new_prompt_restarts_claude_and_a_new_voice_alone_does_not() -> Result<Strin
         let longest = "字".repeat(2000);
         client.character("巨大", &longest, None)?;
         let fourth = client.wait_for_start(4)?;
-        if prompt_of(&fourth) != Some(reply::prompt(&Character::new("巨大", &longest, None)?)) {
+        if prompt_of(&fourth) != Some(reply::prompt(&Character::new("巨大", &longest, None)?, reply::Relaying::Off)) {
             return Err("a persona of 2000 characters did not reach claude intact".to_string());
         }
         client.shutdown()?;
@@ -1391,7 +1463,7 @@ fn a_character_that_breaks_a_limit_is_an_error_and_changes_nothing() -> Result<S
         client.say("ok")?;
         client.expect_turn("a sentence after the refusals", "[nod]收到 [offer]我在這裡", json!(["nod", "offer"]))?;
         let starts = client.starts();
-        if starts.len() != 1 || prompt_of(&starts[0]) != Some(reply::prompt(&Character::standard())) {
+        if starts.len() != 1 || prompt_of(&starts[0]) != Some(reply::prompt(&Character::standard(), reply::Relaying::Off)) {
             return Err(format!("refused characters should leave 小克 and her claude as they were, the starts are {starts:?}"));
         }
         client.shutdown().map(drop)
@@ -1479,7 +1551,7 @@ fn a_character_and_a_greeting_wait_for_the_turn_in_flight() -> Result<String, St
         client.say("ok")?;
         client.expect_turn("a sentence once 阿花 is in place", "[nod]收到 [offer]我在這裡", json!(["nod", "offer"]))?;
         let starts = client.starts();
-        if starts.len() != 2 || prompt_of(&starts[1]) != Some(reply::prompt(&Character::new("阿花", "愛說話。", None)?)) {
+        if starts.len() != 2 || prompt_of(&starts[1]) != Some(reply::prompt(&Character::new("阿花", "愛說話。", None)?, reply::Relaying::Off)) {
             return Err(format!("claude should have been restarted once, for 阿花, the starts are {starts:?}"));
         }
         client.shutdown().map(drop)
@@ -1490,6 +1562,1069 @@ fn a_character_and_a_greeting_wait_for_the_turn_in_flight() -> Result<String, St
         return Err(format!("four parts in the default voice and then two in 阿花's were expected, the service was asked for {heard:?}"));
     }
     Ok(String::new())
+}
+
+/// The chat service, played by a listener in this process, one thread per request so a request it
+/// holds does not hold the next. Like the stand-in for `claude`, it answers by the last thing the
+/// user said: a few words are cases under test and anything else is the two-clause answer.
+struct FakeChat {
+    url: String,
+    /// The request line, the JSON body and the `Authorization` header of every request, in order.
+    heard: Mutex<Vec<(String, Value, Option<String>)>>,
+}
+
+/// `{clauses, language, affect}` as the model writes it, the answer the core is to parse.
+fn chat_answer(list: &[(&str, &str)]) -> String {
+    let clauses: Vec<Value> = list.iter().map(|(text, gesture)| json!({ "text": text, "gesture": gesture })).collect();
+    json!({ "clauses": clauses, "language": "zh-TW", "affect": "calm" }).to_string()
+}
+
+impl FakeChat {
+    fn get() -> Result<&'static FakeChat, String> {
+        static FAKE: OnceLock<FakeChat> = OnceLock::new();
+        if let Some(fake) = FAKE.get() {
+            return Ok(fake);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("starting the stand-in chat service: {e}"))?;
+        let port = listener.local_addr().map_err(|e| format!("its address: {e}"))?.port();
+        let fake = FAKE.get_or_init(|| FakeChat { url: format!("http://127.0.0.1:{port}/v1"), heard: Mutex::new(Vec::new()) });
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                thread::spawn(move || fake.answer_one(stream));
+            }
+        });
+        Ok(fake)
+    }
+
+    fn answer_one(&self, stream: TcpStream) {
+        let mut reader = BufReader::new(&stream);
+        let mut request_line = String::new();
+        let mut length = 0;
+        let mut authorization = None;
+        let mut line = String::new();
+        let _ = reader.read_line(&mut request_line);
+        while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line.trim() != "" {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().unwrap_or(0);
+                } else if name.eq_ignore_ascii_case("authorization") {
+                    authorization = Some(value.trim().to_string());
+                }
+            }
+            line.clear();
+        }
+        let mut body = vec![0; length];
+        let _ = reader.read_exact(&mut body);
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if let Ok(mut heard) = self.heard.lock() {
+            heard.push((request_line.trim().to_string(), body.clone(), authorization.clone()));
+        }
+        let said = body["messages"].as_array().and_then(|m| m.last()).and_then(|m| m["content"].as_str()).unwrap_or("").to_string();
+        let message = |content: Value| json!({ "choices": [{ "index": 0, "message": content, "finish_reason": "stop" }] });
+        let (status, payload) = if request_line.starts_with("GET /v1/models ") {
+            ("200 OK".to_string(), json!({ "object": "list", "data": [{ "id": "b-model" }, { "id": "a-model" }, { "id": "not a name" }] }))
+        } else {
+            match said.as_str() {
+                "four" => ("200 OK".to_string(), message(json!({ "role": "assistant", "content": chat_answer(&[("一", "nod"), ("二", "none"), ("三", "nod"), ("四", "nod")]) }))),
+                "tool" => (
+                    "200 OK".to_string(),
+                    message(json!({ "role": "assistant", "content": null, "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "read_mail", "arguments": "{}" } }] })),
+                ),
+                "refuse" => ("200 OK".to_string(), message(json!({ "role": "assistant", "content": null, "refusal": "I can't help with that." }))),
+                "hang" => {
+                    thread::sleep(Duration::from_secs(30));
+                    ("200 OK".to_string(), message(json!({ "role": "assistant", "content": chat_answer(&[("太晚了", "none")]) })))
+                }
+                "quote" => {
+                    let token = authorization.as_deref().and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("no key was sent");
+                    ("401 Unauthorized".to_string(), json!({ "error": { "message": format!("Incorrect API key provided: {token}.") } }))
+                }
+                other => {
+                    let answer = match other.strip_prefix("echo:") {
+                        Some(echoed) => chat_answer(&[(echoed, "none")]),
+                        None => chat_answer(&[("收到", "nod"), ("我在這裡", "offer")]),
+                    };
+                    ("200 OK".to_string(), message(json!({ "role": "assistant", "content": answer })))
+                }
+            }
+        };
+        let payload = payload.to_string();
+        let head = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len());
+        let mut out = &stream;
+        let _ = out.write_all(head.as_bytes()).and_then(|()| out.write_all(payload.as_bytes())).and_then(|()| out.flush());
+    }
+
+    fn heard(&self) -> Vec<(String, Value, Option<String>)> {
+        self.heard.lock().map(|h| h.clone()).unwrap_or_default()
+    }
+
+    /// The bodies of the chat requests heard since `before`, models listings left out.
+    fn asked_since(&self, before: usize) -> Vec<Value> {
+        self.heard()[before..].iter().filter(|(line, ..)| line.starts_with("POST ")).map(|(_, body, _)| body.clone()).collect()
+    }
+}
+
+/// The `content` of each message of one request, by role: `("user", "ok")`.
+fn messages_of(body: &Value) -> Vec<(String, String)> {
+    let each = body["messages"].as_array().cloned().unwrap_or_default();
+    each.iter().map(|m| (m["role"].as_str().unwrap_or("?").to_string(), m["content"].as_str().unwrap_or("?").to_string())).collect()
+}
+
+fn with_openai<T>(url: &str, env: &[(&str, &str)], body: impl FnOnce(&mut Client) -> Result<T, String>) -> Result<T, String> {
+    with_core_configured(Mode::Openai { url: url.to_string() }, &FakeSpeech::get()?.url, env, |client| {
+        client.expect_ready()?;
+        body(client)
+    })
+}
+
+/// The two-clause answer the fake gives to anything it has no case for.
+const OK_TURN: &str = "[nod]收到 [offer]我在這裡";
+
+fn an_openai_answer_reaches_the_wire_with_its_gestures_as_tags() -> Result<String, String> {
+    let fake = FakeChat::get()?;
+    let before = fake.heard().len();
+    with_openai(&fake.url, &[], |client| {
+        client.say("ok")?;
+        client.expect_turn("a two-clause answer from the HTTP engine", OK_TURN, json!(["nod", "offer"]))?;
+        client.shutdown().map(drop)
+    })?;
+    let heard = fake.heard()[before..].to_vec();
+    let [(line, body, authorization)] = heard.as_slice() else {
+        return Err(format!("one sentence should be one request, the service heard {}", heard.len()));
+    };
+    if line != "POST /v1/chat/completions HTTP/1.1" {
+        return Err(format!("the request should be POST /v1/chat/completions, it was {line:?}"));
+    }
+    let mut keys: Vec<&str> = body.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+    keys.sort_unstable();
+    if keys != ["messages", "model", "reasoning_effort", "response_format", "stream"] {
+        return Err(format!("the body should be exactly messages, model, reasoning_effort, response_format and stream, with no tools and no tool_choice; it has {keys:?}"));
+    }
+    let want_format = json!({ "type": "json_schema", "json_schema": { "name": "reply", "schema": reply::schema(reply::Relaying::Off), "strict": true } });
+    if body["model"] != CHAT_MODEL || body["stream"] != false || body["response_format"] != want_format || body["reasoning_effort"] != "none" {
+        return Err(format!("the body should ask {CHAT_MODEL} for the reply schema, unstreamed and without thinking, it was {body}"));
+    }
+    let want = vec![("system".to_string(), reply::prompt(&Character::standard(), reply::Relaying::Off)), ("user".to_string(), "ok".to_string())];
+    if messages_of(body) != want {
+        return Err(format!("the messages should be 小克's prompt and the sentence, they were {:?}", messages_of(body)));
+    }
+    if authorization.is_some() {
+        return Err("with no key variable named, no Authorization should be sent".to_string());
+    }
+    Ok(String::new())
+}
+
+fn an_openai_answer_the_core_refuses_is_named_and_not_remembered() -> Result<String, String> {
+    let fake = FakeChat::get()?;
+    let before = fake.heard().len();
+    with_openai(&fake.url, &[], |client| {
+        for (word, needles) in [("four", &["4 clauses", "at most 3"][..]), ("tool", &["呼叫工具", "沒有任何工具"][..]), ("refuse", &["拒絕回答", "can't help"][..])] {
+            client.say(word)?;
+            client.expect_error(&format!("the service answers {word:?}"), needles)?;
+        }
+        client.say("ok")?;
+        client.expect_turn("a sentence after the refused answers", OK_TURN, json!(["nod", "offer"]))?;
+        client.shutdown().map(drop)
+    })?;
+    let asked = fake.asked_since(before);
+    let last = asked.last().map(messages_of).unwrap_or_default();
+    if last.len() != 2 {
+        return Err(format!("refused answers should not be sent back as history, the last request was {last:?}"));
+    }
+    Ok(String::new())
+}
+
+fn an_openai_service_that_is_not_running_is_named() -> Result<String, String> {
+    let url = nothing_listening()?;
+    let took = with_openai(&url, &[], |client| {
+        let sent = Instant::now();
+        client.say("有人在嗎")?;
+        client.expect_error("a sentence with the chat service off", &["本機聊天服務沒有開", &url, "Ollama"])?;
+        let took = sent.elapsed();
+        client.shutdown()?;
+        Ok(took)
+    })?;
+    Ok(format!("chat_service_off_to_error={:.0}ms", ms(took)))
+}
+
+fn the_history_sent_is_the_last_eight_turns() -> Result<String, String> {
+    let fake = FakeChat::get()?;
+    let before = fake.heard().len();
+    with_openai(&fake.url, &[], |client| {
+        for n in 1..=10 {
+            let word = format!("echo:{n}");
+            client.say(&word)?;
+            client.expect_turn(&format!("turn {n}"), &n.to_string(), json!([]))?;
+        }
+        client.say("ok")?;
+        client.expect_turn("the eleventh turn", OK_TURN, json!(["nod", "offer"]))?;
+        client.shutdown().map(drop)
+    })?;
+    let asked = fake.asked_since(before);
+    let last = asked.last().map(messages_of).unwrap_or_default();
+    let mut want = vec![("system".to_string(), reply::prompt(&Character::standard(), reply::Relaying::Off))];
+    for n in 3..=10 {
+        want.push(("user".to_string(), format!("echo:{n}")));
+        want.push(("assistant".to_string(), chat_answer(&[(&n.to_string(), "none")])));
+    }
+    want.push(("user".to_string(), "ok".to_string()));
+    if last != want {
+        let users: Vec<&str> = last.iter().filter(|(role, _)| role == "user").map(|(_, text)| text.as_str()).collect();
+        return Err(format!("the eleventh request should carry turns 3 to 10 with their answers as written, it carried {} messages, users {users:?}", last.len()));
+    }
+    Ok(String::new())
+}
+
+fn a_new_character_starts_the_history_over() -> Result<String, String> {
+    let fake = FakeChat::get()?;
+    let before = fake.heard().len();
+    with_openai(&fake.url, &[], |client| {
+        client.say("echo:記得我")?;
+        client.expect_turn("a turn as 小克", "記得我", json!([]))?;
+        client.character("阿花", "愛說話。", None)?;
+        client.say("ok")?;
+        client.expect_turn("a turn as 阿花", OK_TURN, json!(["nod", "offer"]))?;
+        client.character("阿花", "愛說話。", Some("hana"))?;
+        client.say("echo:還在")?;
+        client.expect_turn("a turn after a change of voice alone", "還在", json!([]))?;
+        client.shutdown().map(drop)
+    })?;
+    let asked: Vec<Vec<(String, String)>> = fake.asked_since(before).iter().map(messages_of).collect();
+    let flower = reply::prompt(&Character::new("阿花", "愛說話。", None)?, reply::Relaying::Off);
+    let as_flower = vec![("system".to_string(), flower.clone()), ("user".to_string(), "ok".to_string())];
+    if asked.get(1) != Some(&as_flower) {
+        return Err(format!("阿花's first request should be her prompt and the sentence alone, it was {:?}", asked.get(1)));
+    }
+    let after_voice = asked.get(2).map(|m| m.iter().map(|(role, _)| role.as_str()).collect::<Vec<_>>());
+    if after_voice != Some(vec!["system", "user", "assistant", "user"]) {
+        return Err(format!("a change of voice alone keeps her history, the request after it was {:?}", asked.get(2)));
+    }
+    Ok(String::new())
+}
+
+fn the_chat_key_is_a_header_and_never_a_word_anyone_reads() -> Result<String, String> {
+    let fake = FakeChat::get()?;
+    let before = fake.heard().len();
+    let env = [(chat::KEY_ENV_ENV, KEY_VAR), (KEY_VAR, KEY)];
+    with_openai(&fake.url, &env, |client| {
+        client.say("ok")?;
+        client.expect_turn("a turn with a key", OK_TURN, json!(["nod", "offer"]))?;
+        client.say("quote")?;
+        client.expect_error("a 401 that quotes the key", &["HTTP 401", "Incorrect API key provided", "***", chat::KEY_ENV_ENV])?;
+        client.shutdown()?;
+        client.never_said(KEY)
+    })?;
+    let heard = fake.heard()[before..].to_vec();
+    let bearer = Some(format!("Bearer {KEY}"));
+    if heard.len() != 2 || heard.iter().any(|(_, _, authorization)| *authorization != bearer) {
+        return Err(format!("each request should carry the key from {KEY_VAR} as a bearer token, the headers were {:?}", heard.iter().map(|h| h.2.is_some()).collect::<Vec<_>>()));
+    }
+    if let Some((line, ..)) = heard.iter().find(|(line, body, _)| line.contains(KEY) || body.to_string().contains(KEY)) {
+        return Err(format!("the key should be in the header only, it was in the request line or the body of {line:?}"));
+    }
+    Ok(String::new())
+}
+
+fn claude_is_started_without_the_chat_key() -> Result<String, String> {
+    let log = std::env::temp_dir().join(format!("vrchatcore-selftest-{}-chatkey.log", std::process::id()));
+    let env = [(chat::KEY_ENV_ENV, KEY_VAR), (KEY_VAR, KEY)];
+    with_core_configured(Mode::Stub { log, model: None }, &FakeSpeech::get()?.url, &env, |client| {
+        client.expect_ready()?;
+        let start = client.wait_for_start(1)?;
+        if start["sees_chat_key"] != false {
+            return Err(format!("claude should not be started with the variable that holds the chat key, the stand-in saw {}", start["sees_chat_key"]));
+        }
+        client.say("ok")?;
+        client.expect_turn("a turn through the stand-in", OK_TURN, json!(["nod", "offer"]))?;
+        client.shutdown().map(drop)
+    })?;
+    Ok(String::new())
+}
+
+/// The engine's own wait, called here directly so the limit can be short: the core's is 120 s.
+fn a_chat_turn_ends_at_its_limit_or_at_a_stop() -> Result<String, String> {
+    let fake = FakeChat::get()?;
+    let env = chat::ChatEnv { url: Some(fake.url.clone().into()), model: Some(CHAT_MODEL.into()), key_env: None };
+    let history = chat::History::default();
+    let never = std::sync::atomic::AtomicBool::new(false);
+
+    let short = chat::Client::new(&env, &|_| None, Duration::from_secs(1));
+    let began = Instant::now();
+    let got = short.ask("prompt", &history, "hang", &never);
+    let limited = began.elapsed();
+    match got {
+        Err(claude::Failure::Broken(why)) if why.contains("1 秒內沒有回答") => {}
+        Err(claude::Failure::Broken(why)) => return Err(format!("a turn past its limit should say so, it said {why:?}")),
+        Err(claude::Failure::Stopped) => return Err("a turn past its limit is not a stop".to_string()),
+        Ok(text) => return Err(format!("a turn that never answers should not have answered: {text}")),
+    }
+    if !(Duration::from_millis(900)..Duration::from_secs(3)).contains(&limited) {
+        return Err(format!("a turn with a 1 s limit should end after about 1 s, it ended after {limited:?}"));
+    }
+
+    let long = chat::Client::new(&env, &|_| None, Duration::from_secs(30));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let began = Instant::now();
+    let got = thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(100));
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        long.ask("prompt", &history, "hang", &stop)
+    });
+    let stopped = began.elapsed();
+    if !matches!(got, Err(claude::Failure::Stopped)) || stopped > Duration::from_secs(1) {
+        return Err(format!("a stop during the wait should end it at once as a stop, it took {stopped:?} and gave {:?}", got.map_err(|e| matches!(e, claude::Failure::Stopped))));
+    }
+    Ok(format!("chat_limit={:.0}ms chat_stop={:.0}ms", ms(limited), ms(stopped)))
+}
+
+fn a_chat_turn_in_flight_does_not_keep_the_core_from_leaving() -> Result<String, String> {
+    let fake = FakeChat::get()?;
+    let took = with_openai(&fake.url, &[], |client| {
+        client.say("hang")?;
+        thread::sleep(Duration::from_millis(300));
+        client.shutdown()
+    })?;
+    Ok(format!("leave_mid_chat_turn={:.0}ms", ms(took)))
+}
+
+/// `vrchatcore models` as the settings window's command runs it: the four variables in, one line out.
+fn list_models(env: &[(&str, &str)]) -> Result<(bool, Value), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating own executable: {e}"))?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("models");
+    for name in [chat::URL_ENV, chat::MODEL_ENV, chat::KEY_ENV_ENV] {
+        cmd.env_remove(name);
+    }
+    let out = cmd.envs(env.iter().copied()).output().map_err(|e| format!("running {} models: {e}", exe.display()))?;
+    let line = String::from_utf8_lossy(&out.stdout).into_owned();
+    if line.lines().count() != 1 || line.contains(KEY) || String::from_utf8_lossy(&out.stderr).contains(KEY) {
+        return Err(format!("models should print one line and no key, it printed {line:?}"));
+    }
+    let value = serde_json::from_str(line.trim()).map_err(|e| format!("models printed something that is not JSON ({e}): {line:?}"))?;
+    Ok((out.status.success(), value))
+}
+
+fn the_models_are_listed_for_the_settings_window() -> Result<String, String> {
+    let fake = FakeChat::get()?;
+    let before = fake.heard().len();
+    let (ok, listed) = list_models(&[(chat::URL_ENV, &fake.url), (chat::KEY_ENV_ENV, KEY_VAR), (KEY_VAR, KEY)])?;
+    if !ok || listed != json!({ "models": ["a-model", "b-model"] }) {
+        return Err(format!("the service's models should be listed sorted, without one that is not a name, it printed {listed}"));
+    }
+    let heard = fake.heard()[before..].to_vec();
+    if heard.len() != 1 || heard[0].0 != "GET /v1/models HTTP/1.1" || heard[0].2 != Some(format!("Bearer {KEY}")) {
+        return Err(format!("the listing should be one GET /v1/models with the key as a bearer token, it was {:?}", heard.iter().map(|h| &h.0).collect::<Vec<_>>()));
+    }
+    let off = nothing_listening()?;
+    let (ok, listed) = list_models(&[(chat::URL_ENV, &off)])?;
+    let why = listed["error"].as_str().unwrap_or_default();
+    if ok || !why.contains("本機聊天服務沒有開") || !why.contains(&off) {
+        return Err(format!("a service that is not running should be an error that says so, it printed {listed}"));
+    }
+    let (ok, listed) = list_models(&[(chat::URL_ENV, "http://example.com/v1")])?;
+    let why = listed["error"].as_str().unwrap_or_default();
+    if ok || !why.contains(chat::URL_ENV) || !why.contains("https://") {
+        return Err(format!("plain http off this machine should be refused by the rule, it printed {listed}"));
+    }
+    Ok(String::new())
+}
+
+// Relaying, with the stand-in as the character and as the courier. "Sent" is what the courier ran
+// after the gate, in the file `stub::SENT_ENV` names.
+
+const SUMMARY: &str = "使用者透過 AImate 轉話";
+const BODY: &str = "轉話測試：設定頁的主題做好了。\n可以看了。";
+const TARGET: &str = "AImate桌寵進度整理";
+const TARGET_ADDRESS: &str = "AImate桌寵進度整理 [77db53]";
+
+/// The files a relaying core's stand-ins write.
+struct Relay {
+    sent: PathBuf,
+    heard: PathBuf,
+}
+
+impl Relay {
+    fn lines(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    }
+
+    /// What the courier ran after the gate, ListAgents aside.
+    fn sent(&self) -> Vec<Value> {
+        Self::lines(&self.sent)
+    }
+
+    /// The texts `who` ("character" or "courier") was told, in order.
+    fn heard(&self, who: &str) -> Vec<String> {
+        Self::lines(&self.heard).iter().filter(|l| l["who"] == who).filter_map(|l| l["text"].as_str().map(str::to_string)).collect()
+    }
+}
+
+fn with_courier<T>(name: &str, behaviour: &'static str, step_ms: Option<u64>, env: &[(&str, &str)], body: impl FnOnce(&mut Client, &Relay) -> Result<T, String>) -> Result<T, String> {
+    let base = std::env::temp_dir().join(format!("vrchatcore-selftest-{}-relay-{name}", std::process::id()));
+    let relay = Relay { sent: base.with_extension("sent"), heard: base.with_extension("heard") };
+    let mode = Mode::Courier { log: base.with_extension("log"), sent: relay.sent.clone(), heard: relay.heard.clone(), behaviour, step_ms };
+    let done = with_core_configured(mode, &FakeSpeech::get()?.url, env, |client| {
+        client.expect_ready()?;
+        body(client, &relay)
+    });
+    let _ = std::fs::remove_file(&relay.sent);
+    let _ = std::fs::remove_file(&relay.heard);
+    done
+}
+
+impl Client {
+    fn relay(&mut self, nonce: &str, title: &str, body: &str) -> Result<(), String> {
+        self.send(json!({ "op": "relay", "nonce": nonce, "title": title, "body": body, "summary": SUMMARY }).to_string().as_bytes())
+    }
+
+    /// Every line up to the `relayed` for `nonce`, and that line. Each line has to come within the
+    /// step limit, which is longer than any stand-in run.
+    fn until_relayed(&mut self, nonce: &str) -> Result<(Vec<Value>, Value), String> {
+        let mut before = Vec::new();
+        loop {
+            let line = self.recv(&format!("the relayed for {nonce}"))?;
+            if line["ev"] == "relayed" && line["nonce"] == nonce {
+                return Ok((before, line));
+            }
+            before.push(line);
+        }
+    }
+
+    /// The `relayed` for `nonce`, which must be `outcome` with `gated`, after exactly the steps
+    /// given. `elapsed_ms` and `cost_usd` are only checked for their type.
+    fn expect_relayed(&mut self, nonce: &str, steps: &[Value], outcome: Value, gated: bool) -> Result<Value, String> {
+        let (before, line) = self.until_relayed(nonce)?;
+        if before != steps {
+            return Err(format!("{nonce}: the lines before relayed should be {steps:?}, they were {before:?}"));
+        }
+        let shaped = line.as_object().is_some_and(|o| o.len() == 6) && line["elapsed_ms"].is_u64() && (line["cost_usd"].is_f64() || line["cost_usd"].is_null());
+        if !shaped || line["outcome"] != outcome || line["gated"] != gated {
+            return Err(format!("{nonce}: expected relayed {outcome} gated {gated}, saw {line}"));
+        }
+        Ok(line)
+    }
+}
+
+fn listing(nonce: &str) -> Value {
+    json!({ "ev": "relay_step", "nonce": nonce, "step": "listing" })
+}
+
+fn handing(nonce: &str, to: &str) -> Value {
+    json!({ "ev": "relay_step", "nonce": nonce, "step": "handing", "to": to })
+}
+
+fn not_sent(why: &str) -> Value {
+    json!({ "kind": "not_sent", "why": why, "detail": "" })
+}
+
+fn the_approved_send() -> Value {
+    json!({ "tool": "SendMessage", "input": {
+        "to": TARGET_ADDRESS, "message": BODY, "summary": SUMMARY,
+        "type": "message", "recipient": TARGET_ADDRESS, "recipient_kind": "name", "content": BODY,
+    } })
+}
+
+fn a_faithful_courier_delivers_once() -> Result<String, String> {
+    with_courier("faithful", "faithful", None, &[], |client, relay| {
+        let sent = Instant::now();
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect_relayed(
+            "r-1",
+            &[listing("r-1"), handing("r-1", TARGET_ADDRESS)],
+            json!({ "kind": "delivered", "to": TARGET_ADDRESS, "msg_id": "stub-msg-2" }),
+            true,
+        )?;
+        let took = sent.elapsed();
+        if relay.sent() != [the_approved_send()] {
+            return Err(format!("exactly the approved send should have gone, once: {:?}", relay.sent()));
+        }
+        client.shutdown()?;
+        Ok(format!("stub_relay={:.0}ms", ms(took)))
+    })
+}
+
+/// A courier that does `behaviour` instead of copying the send. Nothing may go.
+fn a_send_that_is_not_the_approved_one_goes_nowhere(name: &str, behaviour: &'static str) -> Result<String, String> {
+    with_courier(name, behaviour, None, &[], |client, relay| {
+        client.relay("r-1", TARGET, BODY)?;
+        let (before, line) = client.until_relayed("r-1")?;
+        let refused = line["outcome"]["detail"].as_str().is_some_and(|d| d.contains("this is not the approved message"));
+        if before != [listing("r-1"), handing("r-1", TARGET_ADDRESS)] || line["outcome"]["why"] != "model_did_not_call" || !refused || line["gated"] != true {
+            return Err(format!("{name}: expected not_sent model_did_not_call naming the gate's refusal, saw {before:?} then {line}"));
+        }
+        if !relay.sent().is_empty() {
+            return Err(format!("nothing should have been sent, the courier ran {:?}", relay.sent()));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn a_courier_that_rewrites_the_text_sends_nothing() -> Result<String, String> {
+    a_send_that_is_not_the_approved_one_goes_nowhere("paraphrase", "paraphrase")
+}
+
+fn a_message_that_says_send_it_elsewhere_goes_nowhere_else() -> Result<String, String> {
+    a_send_that_is_not_the_approved_one_goes_nowhere("redirect", "redirect")
+}
+
+/// Two identical sends in one turn. Where the CLI ends the turn at the first result the second is
+/// never made; where it does not run the stop hook (an older one) the second is made, and it is the
+/// gate that refuses it. One send goes either way.
+fn a_courier_that_calls_twice_sends_once() -> Result<String, String> {
+    for behaviour in ["twice", "twice-nostop"] {
+        with_courier(behaviour, behaviour, None, &[], |client, relay| {
+            client.relay("r-1", TARGET, BODY)?;
+            client.expect_relayed("r-1", &[listing("r-1"), handing("r-1", TARGET_ADDRESS)], json!({ "kind": "delivered", "to": TARGET_ADDRESS, "msg_id": "stub-msg-2" }), true)?;
+            if relay.sent() != [the_approved_send()] {
+                return Err(format!("{behaviour}: two identical calls should send once: {:?}", relay.sent()));
+            }
+            client.shutdown()?;
+            Ok(String::new())
+        })?;
+    }
+    Ok(String::new())
+}
+
+/// A CLI that does not run the stop hook ends each turn with the model's closing word instead. The
+/// run is judged the same.
+fn a_courier_whose_stop_hook_does_not_run_still_delivers() -> Result<String, String> {
+    with_courier("nostop", "faithful-nostop", None, &[], |client, relay| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect_relayed("r-1", &[listing("r-1"), handing("r-1", TARGET_ADDRESS)], json!({ "kind": "delivered", "to": TARGET_ADDRESS, "msg_id": "stub-msg-2" }), true)?;
+        if relay.sent() != [the_approved_send()] {
+            return Err(format!("exactly the approved send should have gone, once: {:?}", relay.sent()));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn a_courier_that_reaches_for_another_tool_gets_none() -> Result<String, String> {
+    with_courier("bash", "bash", None, &[], |client, relay| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect_relayed("r-1", &[listing("r-1"), handing("r-1", TARGET_ADDRESS)], json!({ "kind": "delivered", "to": TARGET_ADDRESS, "msg_id": "stub-msg-3" }), true)?;
+        if relay.sent() != [the_approved_send()] {
+            return Err(format!("Bash should be refused and the approved send go once: {:?}", relay.sent()));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+/// A title the listing cannot name one session for. The courier is never handed the send.
+fn a_title_that_cannot_be_addressed(name: &str, title: &str, why: &str) -> Result<String, String> {
+    with_courier(name, "faithful", None, &[], |client, relay| {
+        client.relay("r-1", title, BODY)?;
+        client.expect_relayed("r-1", &[listing("r-1")], not_sent(why), true)?;
+        let told = relay.heard("courier");
+        if told.len() != 1 || !told[0].starts_with("Call ListAgents") {
+            return Err(format!("the courier should only have been asked for the listing, it was told {told:?}"));
+        }
+        if !relay.sent().is_empty() {
+            return Err(format!("nothing should have been sent: {:?}", relay.sent()));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn a_title_that_forges_a_line_reaches_nobody() -> Result<String, String> {
+    a_title_that_cannot_be_addressed("forged", "冒名頂替", "not_found")
+}
+
+fn a_session_that_is_gone_is_not_found() -> Result<String, String> {
+    a_title_that_cannot_be_addressed("gone", "已經不在的 session", "not_found")
+}
+
+fn two_sessions_with_one_title_are_ambiguous() -> Result<String, String> {
+    a_title_that_cannot_be_addressed("twin", "雙胞胎", "ambiguous")
+}
+
+fn a_gate_that_does_not_run_stops_before_anything_can_be_sent() -> Result<String, String> {
+    with_courier("nohook", "nohook", None, &[], |client, relay| {
+        client.relay("r-1", TARGET, BODY)?;
+        let (before, line) = client.until_relayed("r-1")?;
+        if before != [listing("r-1")] || line["outcome"]["kind"] != "not_sent" || line["outcome"]["why"] != "gate_absent" {
+            return Err(format!("a listing the gate never saw should end the run as gate_absent before handing, saw {before:?} then {line}"));
+        }
+        if relay.heard("courier").len() != 1 || !relay.sent().is_empty() {
+            return Err(format!("the courier should never have been handed the send: told {:?}, ran {:?}", relay.heard("courier"), relay.sent()));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+/// Each outcome a run can come to when the courier dies or hangs, by where it stopped.
+fn a_courier_that_dies_or_hangs_is_judged_by_where_it_stopped() -> Result<String, String> {
+    let cases: [(&str, &'static str, Option<u64>, &str, &str); 5] = [
+        ("die-listing", "die-listing", None, "not_sent", "exited (code 3)"),
+        ("hang-listing", "hang-listing", Some(400), "not_sent", "did not finish its turn"),
+        ("die-after-allow", "die-after-allow", None, "unknown", "no answer came back"),
+        ("hang-after-allow", "hang-after-allow", Some(400), "unknown", "did not finish its turn"),
+        // The gate never saw the send, so nothing is spent, and the send may still have gone.
+        ("skipsend-die", "skipsend-die", None, "unknown", "no answer came back"),
+    ];
+    let mut took = Vec::new();
+    for (name, behaviour, step_ms, kind, needle) in cases {
+        with_courier(name, behaviour, step_ms, &[], |client, relay| {
+            let began = Instant::now();
+            client.relay("r-1", TARGET, BODY)?;
+            let (_, line) = client.until_relayed("r-1")?;
+            let detail = line["outcome"]["detail"].as_str().unwrap_or_default();
+            if line["outcome"]["kind"] != kind || !detail.contains(needle) || line["gated"] != true {
+                return Err(format!("{name}: expected {kind} saying {needle:?}, saw {line}"));
+            }
+            if kind == "not_sent" && line["outcome"]["why"] != "failed" {
+                return Err(format!("{name}: a courier that failed before the gate let anything through is not_sent failed, saw {line}"));
+            }
+            if !relay.sent().is_empty() {
+                return Err(format!("{name}: the courier should have run nothing: {:?}", relay.sent()));
+            }
+            took.push(format!("{name}={:.0}ms", ms(began.elapsed())));
+            client.shutdown().map(drop)
+        })?;
+    }
+    Ok(took.join(" "))
+}
+
+fn the_same_order_twice_is_delivered_once() -> Result<String, String> {
+    with_courier("repeat", "faithful", None, &[], |client, relay| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect_relayed("r-1", &[listing("r-1"), handing("r-1", TARGET_ADDRESS)], json!({ "kind": "delivered", "to": TARGET_ADDRESS, "msg_id": "stub-msg-2" }), true)?;
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect_relayed("r-1", &[], not_sent("repeated"), true)?;
+        if relay.sent().len() != 1 {
+            return Err(format!("one nonce should send once: {:?}", relay.sent()));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn an_order_while_one_runs_is_busy() -> Result<String, String> {
+    with_courier("busy", "hang-listing", Some(1500), &[], |client, relay| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect("the first relay starts", listing("r-1"))?;
+        client.relay("r-2", TARGET, BODY)?;
+        client.expect_relayed("r-2", &[], not_sent("busy"), true)?;
+        // The order in flight sent again is a repeat, not a busy refusal a client could read as its end.
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect_relayed("r-1", &[], not_sent("repeated"), true)?;
+        let (_, first) = client.until_relayed("r-1")?;
+        if first["outcome"]["why"] != "failed" {
+            return Err(format!("the first relay should end on its own terms, saw {first}"));
+        }
+        if relay.heard("courier").len() != 1 {
+            return Err(format!("the busy order should never reach a courier: {:?}", relay.heard("courier")));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn a_relay_ask_turn_has_no_utterance() -> Result<String, String> {
+    with_courier("ask", "faithful", None, &[], |client, _| {
+        let start = client.wait_for_start(1)?;
+        let args: Vec<String> = start["args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let after = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+        if after("--json-schema").and_then(|s| serde_json::from_str::<Value>(&s).ok()) != Some(reply::schema(reply::Relaying::On)) {
+            return Err(format!("with --relay the character should be offered the relay, its schema was {:?}", after("--json-schema")));
+        }
+        if after("--append-system-prompt") != Some(reply::prompt(&Character::standard(), reply::Relaying::On)) {
+            return Err("with --relay the character should be told the relay rule".to_string());
+        }
+        client.say("relayask")?;
+        client.expect("her relay ask", json!({ "ev": "relay_asked", "to": "AImate 那個 session", "text": "設定頁的主題做好了，可以看了。" }))?;
+        client.expect("and the end of a turn that said nothing", json!({ "ev": "turn_end" }))?;
+        client.say("badrelay")?;
+        client.expect_error("a relay that breaks a limit refuses the turn", &["relay.text is empty"])?;
+        client.say("ok")?;
+        client.expect_turn("the next sentence is answered as ever", OK_TURN, json!(["nod", "offer"]))?;
+        if let Some(line) = client.transcript.iter().find(|l| l.contains("已經幫你傳了")) {
+            return Err(format!("what she claimed on the relay turn reached the wire: {line}"));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn relaying_is_off_unless_serve_is_told() -> Result<String, String> {
+    with_stub("relay-off", |client| {
+        let start = client.wait_for_start(1)?;
+        let schema = start["args"].as_array().and_then(|a| a.iter().position(|v| v == "--json-schema").and_then(|i| a.get(i + 1))).and_then(Value::as_str).unwrap_or_default().to_string();
+        if serde_json::from_str::<Value>(&schema).ok() != Some(reply::schema(reply::Relaying::Off)) {
+            return Err(format!("without --relay the schema should be today's, it was {schema}"));
+        }
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect("a relay with relaying off", json!({ "ev": "relayed", "nonce": "r-1", "outcome": not_sent("off"), "gated": true, "elapsed_ms": 0, "cost_usd": null }))?;
+        client.say("relayask")?;
+        client.expect_turn("a relay key from the model is ignored, as before", "[nod]已經幫你傳了", json!(["nod"]))?;
+        if client.starts().len() != 1 {
+            return Err(format!("no courier should have started, the stand-in started {} times", client.starts().len()));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn an_order_that_breaks_a_limit_is_still_answered() -> Result<String, String> {
+    with_courier("unfit", "faithful", None, &[], |client, relay| {
+        client.relay("r-1", TARGET, "")?;
+        client.expect("an empty body", json!({ "ev": "relayed", "nonce": "r-1", "outcome": { "kind": "not_sent", "why": "failed", "detail": "body is empty" }, "gated": true, "elapsed_ms": 0, "cost_usd": null }))?;
+        client.relay("R 1", TARGET, BODY)?;
+        client.expect_error("a nonce that cannot be answered", &["bad request", "nonce"])?;
+        if !relay.heard("courier").is_empty() {
+            return Err("neither should reach a courier".to_string());
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn the_next_sentence_carries_the_last_outcome_once() -> Result<String, String> {
+    with_courier("note", "faithful", None, &[], |client, relay| {
+        client.say("ok")?;
+        client.expect_turn("a sentence before any relay", OK_TURN, json!(["nod", "offer"]))?;
+        client.relay("r-1", TARGET, BODY)?;
+        client.until_relayed("r-1")?;
+        for n in 0..2 {
+            client.say("echo:hi")?;
+            let (_, end) = (client.recv(&format!("say {n} after the relay"))?, client.recv("its turn_end")?);
+            if end != json!({ "ev": "turn_end" }) {
+                return Err(format!("say {n}: expected one utterance and turn_end, saw {end}"));
+            }
+        }
+        let told = relay.heard("character");
+        let want = vec!["ok".to_string(), format!("{}\necho:hi", reply::note(relay::Fact::Delivered)), "echo:hi".to_string()];
+        if told != want {
+            return Err(format!("the sentence after the relay should carry the note once, the character was told {told:?}"));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+/// A sentence the engine failed to answer may not have told her how the relay ended, so the next
+/// one says it again, and the one after that does not.
+fn an_outcome_outlives_a_sentence_that_was_not_answered() -> Result<String, String> {
+    with_courier("note_kept", "faithful", None, &[], |client, relay| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.until_relayed("r-1")?;
+        client.say("notjson")?;
+        client.expect_error("the sentence that carried the note is not answered", &["not JSON"])?;
+        for n in 0..2 {
+            client.say("ok")?;
+            client.expect_turn(&format!("say {n} after the failed one"), OK_TURN, json!(["nod", "offer"]))?;
+        }
+        let note = reply::note(relay::Fact::Delivered);
+        let told = relay.heard("character");
+        let want = vec![format!("{note}\nnotjson"), format!("{note}\nok"), "ok".to_string()];
+        if told != want {
+            return Err(format!("the note should stay until a sentence is answered, the character was told {told:?}"));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn the_courier_runs_without_the_speech_and_chat_keys() -> Result<String, String> {
+    let env = [(voice::KEY_ENV_ENV, KEY_VAR), (KEY_VAR, KEY), (chat::KEY_ENV_ENV, "VRCHATCORE_SELFTEST_CHAT_KEY"), ("VRCHATCORE_SELFTEST_CHAT_KEY", KEY)];
+    with_courier("keys", "faithful", None, &env, |client, _| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.until_relayed("r-1")?;
+        let courier = client.starts().into_iter().find(|s| s["args"].as_array().is_some_and(|a| a.iter().any(|v| v == relay::TOOLS))).ok_or("the courier never started")?;
+        if courier["sees_key"] != false || courier["sees_chat_key"] != false {
+            return Err(format!("the courier should be started without the speech and chat keys, it saw {} and {}", courier["sees_key"], courier["sees_chat_key"]));
+        }
+        client.shutdown()?;
+        client.never_said(KEY)
+    })?;
+    Ok(String::new())
+}
+
+fn the_courier_is_started_with_the_pinned_flags_intact() -> Result<String, String> {
+    with_courier("flags", "faithful", None, &[], |client, _| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.until_relayed("r-1")?;
+        let courier = client.starts().into_iter().find(|s| s["args"].as_array().is_some_and(|a| a.iter().any(|v| v == relay::TOOLS))).ok_or("the courier never started")?;
+        let args: Vec<String> = courier["args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        if args[..checks::COURIER_FLAGS.len().min(args.len())] != checks::COURIER_FLAGS {
+            return Err(format!("the courier's arguments should start with {:?}, they are {args:?}", checks::COURIER_FLAGS));
+        }
+        let tail: Vec<&str> = args.iter().rev().take(checks::ISOLATION.len()).rev().map(String::as_str).collect();
+        if tail != checks::ISOLATION {
+            return Err(format!("the courier's arguments should end with {:?}, they end with {tail:?}", checks::ISOLATION));
+        }
+        let settings: Value = args.iter().position(|a| a == "--settings").and_then(|i| args.get(i + 1)).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+        let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap_or_default();
+        let exe = std::env::current_exe().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+        if !command.starts_with(&format!("\"{exe}\" relay-gate \"")) || !command.contains("/relay-r-1/gate\"") {
+            return Err(format!("the hook should run this executable on the run's gate folder, it is {command:?}"));
+        }
+        let after = &settings["hooks"]["PostToolUse"][0];
+        if after["hooks"][0]["command"] != format!("\"{exe}\" relay-stop") || after["matcher"] != relay::MATCHER {
+            return Err(format!("the stop should run this executable's relay-stop on the same tools, it is {after}"));
+        }
+        let cwd = cwd_of(&courier)?;
+        if cwd.file_name().and_then(|n| n.to_str()) != Some(relay::COURIER_DIR) || courier["entries"] != json!(0) {
+            return Err(format!("the courier should run in an empty folder named {}, it ran in {} holding {}", relay::COURIER_DIR, cwd.display(), courier["entries"]));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn the_courier_and_its_folder_are_gone_after_shutdown() -> Result<String, String> {
+    with_courier("cleanup", "hang-listing", None, &[], |client, _| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect("the relay starts", listing("r-1"))?;
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        let courier = loop {
+            if let Some(start) = client.starts().into_iter().find(|s| s["args"].as_array().is_some_and(|a| a.iter().any(|v| v == relay::TOOLS))) {
+                break start;
+            }
+            if Instant::now() >= deadline {
+                return Err("the courier never started".to_string());
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let (pid, cwd) = (pid_of(&courier)?, cwd_of(&courier)?);
+        let took = client.shutdown()?;
+        wait_gone(pid).map_err(|e| format!("the courier outlived the core: {e}"))?;
+        let run = cwd.parent().map(Path::to_path_buf).unwrap_or_default();
+        let root = run.parent().map(Path::to_path_buf).unwrap_or_default();
+        if run.exists() || root.exists() {
+            return Err(format!("the relay's folder {} was left behind", run.display()));
+        }
+        Ok(format!("leave_mid_relay={:.0}ms", ms(took)))
+    })
+}
+
+fn she_answers_while_a_relay_runs() -> Result<String, String> {
+    with_courier("talk", "hang-listing", Some(3000), &[], |client, _| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect("the relay starts", listing("r-1"))?;
+        client.say("ok")?;
+        client.expect_turn("a sentence while the courier runs is answered first", OK_TURN, json!(["nod", "offer"]))?;
+        client.until_relayed("r-1")?;
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+fn a_send_the_gate_never_saw_is_reported_as_it_was() -> Result<String, String> {
+    with_courier("ungated", "skipsend", None, &[], |client, _| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.expect_relayed("r-1", &[listing("r-1"), handing("r-1", TARGET_ADDRESS)], json!({ "kind": "delivered", "to": TARGET_ADDRESS, "msg_id": "stub-msg-2" }), false)?;
+        client.shutdown().map(drop)
+    })?;
+    with_courier("leaked", "skipsend-paraphrase", None, &[], |client, relay| {
+        client.relay("r-1", TARGET, BODY)?;
+        let message = format!("{BODY}（我幫你潤飾了一下）");
+        client.expect_relayed("r-1", &[listing("r-1"), handing("r-1", TARGET_ADDRESS)], json!({ "kind": "sent_other", "to": TARGET_ADDRESS, "message": message }), false)?;
+        if relay.sent().len() != 1 {
+            return Err(format!("the stand-in sent one message past a gate that did not run: {:?}", relay.sent()));
+        }
+        client.shutdown().map(drop)
+    })?;
+    Ok(String::new())
+}
+
+/// `relay-gate` as the CLI runs it, one process per call. Four processes handed the approved send at
+/// once let exactly one through, and a gate that cannot read its call denies, with exit code 0.
+fn the_gate_process_lets_one_of_four_racing_sends_through() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating own executable: {e}"))?;
+    let approved = json!({ "to": TARGET_ADDRESS, "message": BODY, "summary": SUMMARY });
+    let call = json!({ "hook_event_name": "PreToolUse", "tool_name": "SendMessage", "tool_input": the_approved_send()["input"] }).to_string();
+    let gate = |dir: &Path, stdin: &[u8], args: &[&str]| -> Result<(Value, Option<i32>), String> {
+        let out = Command::new(&exe).arg("relay-gate").args(args).arg(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+            .and_then(|mut child| {
+                if let Some(mut pipe) = child.stdin.take() {
+                    let _ = pipe.write_all(stdin);
+                }
+                child.wait_with_output()
+            })
+            .map_err(|e| format!("running relay-gate: {e}"))?;
+        let decision = serde_json::from_slice::<Value>(&out.stdout).map_err(|e| format!("relay-gate printed {:?} ({e})", String::from_utf8_lossy(&out.stdout)))?;
+        Ok((decision["hookSpecificOutput"].clone(), out.status.code()))
+    };
+    let mut allowed = Vec::new();
+    for round in 0..5 {
+        let dir = std::env::temp_dir().join(format!("vrchatcore-selftest-{}-gate-procs-{round}", std::process::id()));
+        scratch::fresh(&dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
+        std::fs::write(dir.join("armed.json"), approved.to_string()).map_err(|e| format!("arming: {e}"))?;
+        let mut children = Vec::new();
+        for _ in 0..4 {
+            children.push(Command::new(&exe).arg("relay-gate").arg(&dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| format!("running relay-gate: {e}"))?);
+        }
+        for child in &mut children {
+            if let Some(mut pipe) = child.stdin.take() {
+                let _ = pipe.write_all(call.as_bytes());
+            }
+        }
+        let mut allows = 0;
+        for child in children {
+            let out = child.wait_with_output().map_err(|e| format!("waiting for relay-gate: {e}"))?;
+            let decision: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+            if out.status.code() != Some(0) {
+                return Err(format!("relay-gate should exit 0 for every answer, it exited {:?}", out.status.code()));
+            }
+            allows += usize::from(decision["hookSpecificOutput"]["permissionDecision"] == "allow");
+        }
+        scratch::remove(&dir);
+        allowed.push(allows);
+    }
+    if allowed.iter().any(|&n| n != 1) {
+        return Err(format!("four racing gates should allow one send each round, they allowed {allowed:?}"));
+    }
+    let dir = std::env::temp_dir().join(format!("vrchatcore-selftest-{}-gate-procs-bad", std::process::id()));
+    scratch::fresh(&dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
+    for (stdin, args, what) in [(&b"not json"[..], &[][..], "a call it cannot read"), (call.as_bytes(), &["extra"][..], "a second folder"), (call.as_bytes(), &[][..], "a send with nothing armed")] {
+        let (said, code) = gate(&dir, stdin, args)?;
+        if said["permissionDecision"] != "deny" || code != Some(0) {
+            return Err(format!("{what} should be a deny with exit code 0, it was {said} with {code:?}"));
+        }
+    }
+    scratch::remove(&dir);
+    Ok(String::new())
+}
+
+/// `relay-stop` as the CLI runs it: one line, exit code 0, whatever it is handed.
+fn the_stop_hook_process_prints_the_stop_line() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating own executable: {e}"))?;
+    let call = json!({ "hook_event_name": "PostToolUse", "tool_name": "ListAgents", "tool_input": {}, "tool_response": {} }).to_string();
+    let out = Command::new(&exe).arg("relay-stop").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+        .and_then(|mut child| {
+            if let Some(mut pipe) = child.stdin.take() {
+                let _ = pipe.write_all(call.as_bytes());
+            }
+            child.wait_with_output()
+        })
+        .map_err(|e| format!("running relay-stop: {e}"))?;
+    if out.stdout != b"{\"continue\":false,\"stopReason\":\"relay: the call is done\"}\n" || out.status.code() != Some(0) {
+        return Err(format!("relay-stop should print the stop line and exit 0, it printed {:?} and exited {:?}", String::from_utf8_lossy(&out.stdout), out.status.code()));
+    }
+    Ok(String::new())
+}
+
+/// The stand-in courier as the CLI behaves with a `PostToolUse` hook (measured 2026-11-13): after a
+/// call that ran, a hook that prints `continue: false` ends the turn with no closing word from the
+/// model, and a hook that cannot be started, or prints anything else, changes nothing. The courier
+/// checks above run on it, so it is checked on its own stream here.
+fn the_stand_in_courier_ends_a_turn_where_its_stop_hook_says() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating own executable: {e}"))?;
+    let path = exe.to_string_lossy().replace('\\', "/");
+    let stream = |behaviour: &str, hook: &str| -> Result<Vec<String>, String> {
+        let settings = json!({ "hooks": { "PostToolUse": [{ "matcher": relay::MATCHER, "hooks": [{ "type": "command", "command": hook }] }] } });
+        let out = Command::new(&exe).arg("-p").args(["--model", relay::MODEL, "--tools", relay::TOOLS, "--settings", &settings.to_string()])
+            .env(stub::COURIER_ENV, behaviour).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+            .and_then(|mut child| {
+                if let Some(mut pipe) = child.stdin.take() {
+                    let _ = pipe.write_all(claude::user_line(relay::list_line()).as_bytes());
+                }
+                child.wait_with_output()
+            })
+            .map_err(|e| format!("running the stand-in courier: {e}"))?;
+        let lines = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect::<Vec<_>>();
+        Ok(lines.iter().map(|l| (if l["message"]["content"][0]["text"] == "DONE" { "DONE" } else { l["type"].as_str().unwrap_or("?") }).to_string()).collect())
+    };
+    let stop = format!("\"{path}\" relay-stop");
+    let ended = ["system", "assistant", "user", "result"];
+    let closed = ["system", "assistant", "user", "DONE", "result"];
+    let cases: [(&str, &str, String, &[&str]); 4] = [
+        ("a hook that prints continue: false", "faithful", stop.clone(), &ended),
+        ("a CLI that does not run the hook", "faithful-nostop", stop, &closed),
+        ("a hook that cannot be started", "faithful", format!("\"{path}.missing\" relay-stop"), &closed),
+        ("a hook that prints something else", "faithful", format!("\"{path}\" relay-gate"), &closed),
+    ];
+    for (what, behaviour, hook, want) in cases {
+        let got = stream(behaviour, &hook)?;
+        if got != want {
+            return Err(format!("{what}: the listing turn should print {want:?}, it printed {got:?}"));
+        }
+    }
+    Ok(String::new())
+}
+
+/// Neither the character's `claude` nor the courier is started with `CLAUDE_CODE_ENTRYPOINT`, even
+/// when the core has it, and both keep the other `CLAUDE_CODE_` variables.
+fn claude_children_do_not_inherit_the_hosts_entrypoint() -> Result<String, String> {
+    let env = [("CLAUDE_CODE_ENTRYPOINT", "claude-desktop"), ("CLAUDE_CODE_SELFTEST_KEPT", "1")];
+    with_courier("entrypoint", "faithful", None, &env, |client, _| {
+        client.relay("r-1", TARGET, BODY)?;
+        client.until_relayed("r-1")?;
+        let starts = client.starts();
+        let is_courier = |start: &Value| start["args"].as_array().is_some_and(|a| a.iter().any(|v| v == relay::TOOLS));
+        if !starts.iter().any(is_courier) || starts.iter().all(is_courier) {
+            return Err(format!("both the character's claude and the courier should have started, the stand-in started {} times", starts.len()));
+        }
+        for start in &starts {
+            let who = if is_courier(start) { "the courier" } else { "the character's claude" };
+            let names: Vec<&str> = start["claude_env"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            if names.contains(&"CLAUDE_CODE_ENTRYPOINT") {
+                return Err(format!("{who} should be started without CLAUDE_CODE_ENTRYPOINT, the stand-in saw {names:?}"));
+            }
+            if !names.contains(&"CLAUDE_CODE_SELFTEST_KEPT") {
+                return Err(format!("{who} should keep the other CLAUDE_CODE_ variables, the stand-in saw {names:?}"));
+            }
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
+}
+
+/// The outcome goes out while the courier's process and the run's folder are still there, and
+/// `elapsed_ms` stops where the outcome does. The stand-in takes 1.5 s to leave once its input
+/// closes, so the process outlasts the 400 ms it is given and has to be killed.
+fn the_outcome_goes_out_before_the_courier_and_its_folder_are_gone() -> Result<String, String> {
+    with_courier("linger", "linger", None, &[], |client, _| {
+        let sent = Instant::now();
+        client.relay("r-1", TARGET, BODY)?;
+        let line = client.expect_relayed("r-1", &[listing("r-1"), handing("r-1", TARGET_ADDRESS)], json!({ "kind": "delivered", "to": TARGET_ADDRESS, "msg_id": "stub-msg-2" }), true)?;
+        let courier = client.starts().into_iter().find(|s| s["args"].as_array().is_some_and(|a| a.iter().any(|v| v == relay::TOOLS))).ok_or("the courier never started")?;
+        let (pid, cwd) = (pid_of(&courier)?, cwd_of(&courier)?);
+        let run = cwd.parent().map(Path::to_path_buf).unwrap_or_default();
+        if !run.exists() {
+            return Err(format!("the run's folder {} was gone before the outcome went out", run.display()));
+        }
+        wait_gone(pid).map_err(|e| format!("the courier was never ended: {e}"))?;
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        while run.exists() {
+            if Instant::now() >= deadline {
+                return Err(format!("the run's folder {} was left behind", run.display()));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (total, elapsed) = (ms(sent.elapsed()), line["elapsed_ms"].as_f64().unwrap_or_default());
+        if elapsed + 300.0 > total {
+            return Err(format!("elapsed_ms ({elapsed:.0}) should stop where the outcome goes out, and the courier's 400 ms of leaving come after it, but the whole took {total:.0} ms"));
+        }
+        client.shutdown()?;
+        Ok(format!("outcome_before_cleanup={elapsed:.0}ms_of_{total:.0}ms"))
+    })
+}
+
+/// A courier that has not made its call when its turn times out may still make it. It is stopped
+/// before the outcome is read, so that a `not_sent` is not followed by a send. The stand-in takes
+/// 1.6 s to make the call and each turn is given 1 s, which the listing turn needs a small part of.
+fn a_courier_that_times_out_cannot_send_after_the_outcome() -> Result<String, String> {
+    with_courier("late", "late-send", Some(1000), &[], |client, relay| {
+        client.relay("r-1", TARGET, BODY)?;
+        let (before, line) = client.until_relayed("r-1")?;
+        if before != [listing("r-1"), handing("r-1", TARGET_ADDRESS)] || line["outcome"]["kind"] != "not_sent" || line["outcome"]["why"] != "failed" {
+            return Err(format!("the send turn should time out as not_sent failed, saw {before:?} then {line}"));
+        }
+        thread::sleep(Duration::from_millis(900));
+        if !relay.sent().is_empty() {
+            return Err(format!("the courier sent after the outcome said nothing had gone: {:?}", relay.sent()));
+        }
+        client.shutdown()?;
+        Ok(String::new())
+    })
 }
 
 pub fn run() -> ExitCode {

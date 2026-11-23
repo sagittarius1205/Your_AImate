@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <title>VRPet Spike</title>
+<link rel="stylesheet" href="theme.css" />
 <style>
   /* What the settings window controls, set by `applySettings` below from what Rust sends. These are
      the design's defaults (Docs/DESIGN_Settings.md 1), which hold until Rust has answered.
@@ -15,24 +16,10 @@
     --say-size: 13px;
     --bubble-opacity: 0.92;
 
-    /* The interface theme (Docs/DESIGN_Themes.md), set by `applyTheme` below from what Rust lists.
-       A theme is five colours, a radius and two pictures; these are the bundled 紙本, which holds
-       until Rust answers. Every colour on the dialogue is one of the five or mixed from them here,
-       so a theme recolours the whole of it and cannot reach anything else. */
-    --accent: #d97757;
-    --paper: #f3f2ef;
-    --ink: #2b2b2b;
-    --border: #cfc8bc;
-    --controls: #f3f2ef;
-    --radius: 18px;
-    --icon: url("themes/paper/icon.svg");
-    --paper-texture: url("themes/paper/paper.svg");
-
-    /* Mixed from the five: her name is the accent toward the ink, so it reads on a light paper and a
-       dark one alike; the faint marks are the ink toward the paper. */
-    --name: color-mix(in srgb, var(--accent) 60%, var(--ink));
-    --faint: color-mix(in srgb, var(--ink) 40%, var(--paper));
-    --scroll: color-mix(in srgb, var(--ink) 30%, transparent);
+    /* The interface theme's colours, radius and pictures, and the colours mixed from them, are in
+       `theme.css`, which the settings window reads too, and `theme.js` writes a theme from Rust over
+       them (`applyTheme` below). What belongs to this page alone is the paper at the opacity the
+       settings give the dialogue, which the dialogue and the fleet list are both drawn on. */
     --paper-seen: color-mix(in srgb, var(--paper) calc(var(--bubble-opacity) * 100%), transparent);
   }
   /* A theme without an icon leaves no gap where it would be. */
@@ -46,7 +33,7 @@
     background: transparent;
     overflow: hidden;
     font-family: "Segoe UI", system-ui, sans-serif;
-    color: #e8eaed;
+    color: var(--ink);
     user-select: none;
     cursor: default;
   }
@@ -81,8 +68,8 @@
   /* Something is waiting. Same colour as the row's own chip, so the collapsed button and the open
      list say it the same way. */
   #gate.wait {
-    border-color: #c2410c;
-    background: #c2410c;
+    border-color: var(--wait);
+    background: var(--wait);
     color: #fff;
     font-weight: 600;
   }
@@ -98,7 +85,13 @@
      before `#char` in the document, so without it the figure paints over the list. Found by looking
      at it: every rectangle was right and the session names were behind an arm, which is a thing no
      amount of rectangle arithmetic could have said. Nothing else here sets a z-index, and
-     `pet_page` fails if the character ever does, because that would put the figure back on top. */
+     `pet_page` fails if the character ever does, because that would put the figure back on top.
+
+     It is paper like the history sheet, which is what lin asked for on 2026-11-10 after seeing it
+     dark beside a cream dialogue (Docs/DESIGN_Themes.md 2): the theme's colours and radius, and the
+     opacity the settings give the dialogue. Its text is ink, or a mix of the theme's colours that
+     `pet_themes` works out reads at 4.5 to 1 on both bundled themes; the only colours that are not the
+     theme's are the signals, `--wait` and `--danger`, which a theme cannot change. */
   #panel {
     position: absolute;
     z-index: 2;
@@ -106,15 +99,20 @@
     right: 10px;
     bottom: 228px;
     max-height: 300px;
+    overflow-x: hidden;
     overflow-y: auto;
-    padding: 10px 12px;
-    background: rgba(18, 20, 24, 0.92);
-    border-radius: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--paper-seen);
+    background-image: var(--paper-texture);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+    color: var(--ink);
     font-size: 12px;
     line-height: 1.45;
     box-sizing: border-box;
     scrollbar-width: thin;
-    scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+    scrollbar-color: var(--scroll) transparent;
   }
   #panel.shut { display: none; }
 
@@ -123,14 +121,22 @@
     font-size: 12px;
     font-weight: 600;
     letter-spacing: 0.02em;
-    color: #9fb4ff;
+    color: var(--name);
   }
 
-  .diag { color: #8a9099; font-size: 11px; margin-bottom: 6px; }
-  .diag b { color: #e8eaed; font-weight: 600; }
-  .err { color: #ff8f8f; }
+  .diag { color: var(--dim); font-size: 11px; margin-bottom: 6px; }
+  .diag b { color: var(--ink); font-weight: 600; }
+  .err { color: var(--error-text); }
 
-  #rows { display: grid; gap: 3px; max-height: 300px; overflow: hidden; }
+  /* No height of its own: `#panel` is what scrolls, through every row. This was capped at 300px with
+     `overflow: hidden`, inside a panel capped at 300px that scrolls, so the panel scrolled a grid that
+     had already cut itself off after about 14.7 rows, and a user with 20 sessions could reach 15.
+
+     One column of `minmax(0, 1fr)` and not the grid's own `auto` one, because an auto column grows to
+     the widest row's unbroken text, a long name pushed the age out of the panel, and the ellipsis on
+     the name never had a width to cut at. `overflow: hidden` on this box was hiding that, and it is
+     gone. */
+  #rows { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; }
 
   .row { display: flex; gap: 8px; align-items: baseline; }
   /* The name and what the session is asking stack, so the status chip and the age keep their
@@ -142,7 +148,7 @@
     min-width: 54px;
     padding: 0 5px;
     border-radius: 4px;
-    background: rgba(255, 255, 255, 0.1);
+    background: color-mix(in srgb, var(--ink) 10%, transparent);
     font-size: 10px;
     text-align: center;
   }
@@ -150,7 +156,7 @@
   /* What the session is asking. Clamped to two lines in CSS as well as capped in Rust: the Rust
      cap counts characters, and characters are not pixels. */
   .row .ask {
-    color: #ffb366;
+    color: var(--warn-text);
     font-size: 10px;
     line-height: 1.35;
     overflow: hidden;
@@ -158,13 +164,214 @@
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
   }
-  .row .ag { flex: 0 0 auto; color: #8a9099; font-size: 11px; }
-  .row.here .nm { color: #9fb4ff; }
+  .row .ag { flex: 0 0 auto; color: var(--dim); font-size: 11px; }
+  .row.here .nm { color: var(--name); }
 
   /* A session stopped at a permission prompt. The only row the user has to act on. */
-  .row.wait .st { background: #c2410c; color: #fff; font-weight: 600; }
-  .row.wait .nm { color: #ffd9a8; font-weight: 600; }
-  b.wait { color: #ffb366; }
+  .row.wait .st { background: var(--wait); color: #fff; font-weight: 600; }
+  .row.wait .nm { color: var(--warn-text); font-weight: 600; }
+  b.wait { color: var(--warn-text); }
+
+  /* The pin, at the front of the row. A toggle, not a mark: `aria-pressed` says whether the session
+     is pinned, and the pinned one stands upright in the theme's name colour while the others lie
+     tilted and dim, so the state is in the shape as well as the colour. It is the shape of a drawing
+     pin cut out of one colour (`mask`), so it takes the text colour of whatever theme is on. It is
+     inside `#panel`, whose rectangle is reported while the list is open, so the window takes its
+     clicks without a rectangle of its own. */
+  .row .pin {
+    flex: none;
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 18px;
+    margin: -1px -4px 0 -6px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--dim);
+    cursor: pointer;
+  }
+  .row .pin::before {
+    content: "";
+    width: 12px;
+    height: 12px;
+    background: currentColor;
+    -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M5 1.5h6v1.3l-.8.6.6 4.1h1.7V9H8.6v5.5H7.4V9H3.5V7.5h1.7l.6-4.1L5 2.8z'/%3E%3C/svg%3E") center / contain no-repeat;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M5 1.5h6v1.3l-.8.6.6 4.1h1.7V9H8.6v5.5H7.4V9H3.5V7.5h1.7l.6-4.1L5 2.8z'/%3E%3C/svg%3E") center / contain no-repeat;
+    transform: rotate(45deg);
+    opacity: 0.75;
+  }
+  .row .pin:hover { background: color-mix(in srgb, var(--ink) 10%, transparent); color: var(--ink); }
+  .row .pin:focus-visible { outline: 1px solid var(--accent); }
+  .row .pin[aria-pressed="true"] { color: var(--name); }
+  .row .pin[aria-pressed="true"]::before { transform: none; opacity: 1; }
+
+  /* The row's 轉話, beside its pin and drawn the same way: a paper plane cut out of one colour. It
+     only opens the relay sheet on that row; the sheet's 送出 is what sends. A row with no name has
+     nothing the relay could address, so its button is there and cannot be pressed. */
+  .row .relay {
+    flex: none;
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 18px;
+    margin: -1px -4px 0 -4px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--dim);
+    cursor: pointer;
+  }
+  .row .relay::before {
+    content: "";
+    width: 12px;
+    height: 12px;
+    background: currentColor;
+    -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M1 7.2 15 1.5 10.4 15 7.6 9.4zM7.6 9.4 15 1.5'/%3E%3C/svg%3E") center / contain no-repeat;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M1 7.2 15 1.5 10.4 15 7.6 9.4zM7.6 9.4 15 1.5'/%3E%3C/svg%3E") center / contain no-repeat;
+    opacity: 0.75;
+  }
+  .row .relay:hover:enabled { background: color-mix(in srgb, var(--ink) 10%, transparent); color: var(--ink); }
+  .row .relay:focus-visible { outline: 1px solid var(--accent); }
+  .row .relay:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  /* The relay sheet (Docs/DESIGN_Pet.md 6.2): the exact target, the exact words that leave, and the
+     one button that sends them. It sits in the band above her head, from the top the choices use and
+     by the same rule for its height, so it ends above her head at every `--figure` and she is seen
+     saying what it is. Paper like the history and the list. It claims no layer, because it comes
+     after `#char`, and the open list, which has one, is shut whenever the sheet opens. The row of
+     buttons sticks to the bottom, so 送出 stays in view while the sheet scrolls at a large figure or
+     a large `--ui`. */
+  #relay {
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    top: 8px;
+    max-height: calc(236px - 293.6px * (var(--figure) - 1));
+    overflow-x: hidden;
+    overflow-y: auto;
+    box-sizing: border-box;
+    padding: 8px 12px 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--paper-seen);
+    background-image: var(--paper-texture);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+    color: var(--ink);
+    font-size: calc(12px * var(--ui));
+    line-height: 1.45;
+    scrollbar-width: thin;
+    scrollbar-color: var(--scroll) transparent;
+  }
+  #relay.shut { display: none; }
+  .relay-to { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+  .relay-head { flex: none; color: var(--name); font-weight: 700; }
+  .relay-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .relay-where { color: var(--dim); font-size: calc(11px * var(--ui)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .relay-link {
+    flex: none;
+    padding: 0 2px;
+    border: 0;
+    background: transparent;
+    color: var(--name);
+    font: inherit;
+    font-size: calc(11px * var(--ui));
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .relay-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; margin: 4px 0; }
+  .relay-choice {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    min-width: 0;
+    padding: 1px 6px;
+    border: 1px solid transparent;
+    border-radius: calc(var(--radius) * 0.35);
+    background: transparent;
+    color: var(--ink);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .relay-choice .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .relay-choice .why { flex: none; color: var(--dim); font-size: calc(10px * var(--ui)); }
+  .relay-choice:hover:enabled { border-color: var(--border); }
+  .relay-choice[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--paper)); }
+  .relay-choice:disabled { color: var(--dim); cursor: not-allowed; }
+  .relay-label { margin-top: 4px; color: var(--dim); font-size: calc(11px * var(--ui)); }
+  .relay-quote { color: var(--dim); font-size: calc(11px * var(--ui)); }
+  /* Selectable, unlike the rest of the window, because it is a field the user edits. */
+  .relay-field {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 2px;
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) * 0.35);
+    background: var(--controls);
+    color: var(--ink);
+    font: inherit;
+    resize: none;
+    user-select: text;
+  }
+  .relay-field:focus { outline: none; border-color: var(--accent); }
+  .relay-meta { color: var(--dim); font-size: calc(11px * var(--ui)); overflow-wrap: anywhere; }
+  .relay-meta.over { color: var(--error-text); }
+  .relay-note { color: var(--dim); font-size: calc(11px * var(--ui)); }
+  .relay-error { color: var(--error-text); overflow-wrap: anywhere; }
+  .relay-error:empty { display: none; }
+  .relay-reason { overflow-wrap: anywhere; }
+  .relay-sent {
+    max-height: calc(54px * var(--ui));
+    overflow-y: auto;
+    margin-top: 2px;
+    padding: 2px 8px;
+    border-left: 2px solid var(--border);
+    color: var(--dim);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+  }
+  .relay-step { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .relay-step::before { content: "○ "; }
+  .relay-step.on { color: var(--ink); font-weight: 600; }
+  .relay-step.on::before { content: "● "; }
+  .relay-step.done::before { content: "✓ "; }
+  .relay-done { flex: none; font-weight: 700; }
+  .relay-done.delivered { color: var(--name); }
+  .relay-done.unknown { color: var(--warn-text); }
+  .relay-done.bad { color: var(--error-text); }
+  .relay-act {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    gap: 6px;
+    margin: 6px -12px 0;
+    padding: 6px 12px 8px;
+    background: var(--paper);
+  }
+  .relay-act > :first-child { margin-left: auto; }
+  .relay-btn {
+    height: calc(24px * var(--ui));
+    padding: 0 14px;
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) * 2);
+    background: var(--controls);
+    color: var(--ink);
+    font: inherit;
+    cursor: pointer;
+  }
+  .relay-btn:hover:enabled { border-color: var(--accent); }
+  .relay-btn.send { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--controls)); font-weight: 600; }
+  .relay-btn:disabled { border-color: var(--border); background: var(--controls); color: var(--dim); cursor: not-allowed; }
 
   /* The character. Its rect is reported to Rust, which toggles click-through from outside the
      window, because a window that ignores the cursor never sees the cursor.
@@ -508,6 +715,7 @@
 <div id="chatBubble"></div>
 <div id="chatInput"></div>
 <div id="chatLog"></div>
+<div id="relay" class="shut" role="dialog" aria-label="轉話"></div>
 <button id="gate" type="button" title="在等你的 session"><span class="n" id="gateN">0</span>在等</button>
 <div id="controls">
   <button id="settingsToggle" type="button" title="設定">設定</button>
@@ -522,6 +730,7 @@
 -->
 <script src="character.js"></script>
 <script src="chat.js"></script>
+<script src="theme.js"></script>
 
 <script>
 const invoke = window.__TAURI__.core.invoke;
@@ -569,6 +778,7 @@ const rowsEl = document.getElementById("rows");
 const panelEl = document.getElementById("panel");
 const gateEl = document.getElementById("gate");
 const gateNEl = document.getElementById("gateN");
+const relayEl = document.getElementById("relay");
 
 // ---------------------------------------------------------------- the dialogue
 
@@ -951,6 +1161,7 @@ function regionOf(el) {
 function panelRegions() {
   const mine = [regionOf(toggleEl), regionOf(quitEl), regionOf(settingsToggleEl), regionOf(gateEl)];
   if (!panelEl.classList.contains("shut")) mine.push(regionOf(panelEl));
+  if (!relayEl.classList.contains("shut")) mine.push(regionOf(relayEl));
   return Chat.regions().concat(mine);
 }
 
@@ -968,6 +1179,12 @@ new ResizeObserver(reportRegions).observe(charEl);
 new ResizeObserver(reportRegions).observe(gateEl);
 // The row of buttons too: the quit button grows when it asks, and moves the settings button with it.
 new ResizeObserver(reportRegions).observe(document.getElementById("controls"));
+// The fleet list too: it is as tall as its rows up to a limit, so a poll that brings a session or
+// takes one away changes the rectangle the window takes clicks in, and without this the pin at the
+// bottom of a list that just grew would be under a window that still lets the click through.
+new ResizeObserver(reportRegions).observe(panelEl);
+// The relay sheet too, which changes height with its state and with the text in its field.
+new ResizeObserver(reportRegions).observe(relayEl);
 // `chat.js` redraws by replacing its children, so a change to them is the signal that its
 // geometry moved. The observer runs after the redraw has finished. All four roots, because a
 // turn with no choices changes only one of them and the regions still move.
@@ -978,6 +1195,7 @@ Object.values(chatEls).forEach((el) => chatWatch.observe(el, { childList: true, 
 // a class, so the regions are reported from this one place or the window keeps the old set.
 gateEl.addEventListener("click", () => {
   const opening = panelEl.classList.contains("shut");
+  if (opening) pinErr = openErr = null;
   panelEl.classList.toggle("shut", !opening);
   gateEl.classList.toggle("open", opening);
   reportRegions();
@@ -1416,25 +1634,13 @@ function applySettings(s) {
 // ---------------------------------------------------------------- the interface theme
 
 // The theme in effect, from Rust (main.rs `themes`), which scanned the folders and fell back to the
-// default with a reason when the chosen one cannot be shown. A theme is values and not CSS: each
-// one is checked again here before it is written into a custom property, so a value that got past
-// Rust still could not close the property and start another declaration, and a picture's URL is
-// only ever one of the two places Rust serves theme files from.
+// default with a reason when the chosen one cannot be shown. Checking it and putting it on is
+// `theme.js`, which the settings window loads as well, so the two windows cannot disagree about what
+// a theme is. The settings window follows the choice the way this page does, at the same moment.
 let themeAsked = null;
-const THEME_COLOR = /^#[0-9a-f]{6}$/;
-const THEME_URL = /^(themes\/|http:\/\/theme\.localhost\/|theme:\/\/localhost\/)[a-z0-9_.\-\/]+\.(svg|png)$/;
 
 function applyTheme(t) {
-  const root = document.documentElement;
-  for (const role of ["accent", "paper", "ink", "border", "controls"]) {
-    const c = String(t.colors[role]);
-    if (THEME_COLOR.test(c)) root.style.setProperty("--" + role, c);
-  }
-  if (Number.isInteger(t.radius) && t.radius >= 0 && t.radius <= 28) root.style.setProperty("--radius", t.radius + "px");
-  const picture = (url) => (typeof url === "string" && THEME_URL.test(url) ? 'url("' + url + '")' : "none");
-  root.style.setProperty("--icon", picture(t.icon));
-  root.style.setProperty("--paper-texture", picture(t.paper_texture));
-  root.classList.toggle("no-icon", picture(t.icon) === "none");
+  if (!Theme.apply(t)) console.warn("theme: not a theme this page can wear, so the built-in 紙本 is showing");
   // A radius changes the controls' rectangles no more than their corners, but the strip's buttons
   // and the field are reported from their boxes, and this costs one message.
   reportRegions();
@@ -1482,7 +1688,10 @@ requestAnimationFrame(frame);
 // ---------------------------------------------------------------- the fleet
 
 const HERE = "D:\\Your_AImate";
-let fleetErr = null, sessions = [], statuses = new Set();
+let fleetErr = null, pinErr = null, openErr = null, sessions = [], statuses = new Set();
+// Which answer is the newest. A poll that was asked before a pin and answers after it carries the
+// list as it was before, and would put the row back where it was until the next poll.
+let asked = 0;
 
 function age(ms) {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -1492,12 +1701,30 @@ function age(ms) {
 }
 
 async function poll() {
+  const mine = ++asked;
   try {
-    sessions = await invoke("fleet");
+    const rows = await invoke("fleet");
+    if (mine !== asked) return;
+    sessions = rows;
     fleetErr = null;
     for (const s of sessions) statuses.add(s.status);
   } catch (e) {
+    if (mine !== asked) return;
     fleetErr = String(e);
+  }
+  render();
+}
+
+// Pins or unpins one session. Rust answers with the list as it now stands, in order, so the row moves
+// at the click and not at the next poll; Rust is the one that orders it, and this page lists the rows
+// in the order it is sent. A pin that Rust refuses (the cap) is said in the line above the list.
+async function pin(sessionId, pinned) {
+  asked++;
+  try {
+    sessions = await invoke("pin_session", { sessionId, pinned });
+    pinErr = null;
+  } catch (e) {
+    pinErr = String(e);
   }
   render();
 }
@@ -1533,6 +1760,8 @@ function render() {
   diagEl.replaceChildren(line);
   if (charStatus.error) diagEl.append(el("div", "err", "character: " + charStatus.error));
   if (fleetErr) diagEl.append(el("div", "err", "fleet: " + fleetErr));
+  if (pinErr) diagEl.append(el("div", "err", "pin: " + pinErr));
+  if (openErr) diagEl.append(el("div", "err", "轉話：" + openErr));
   if (!charStatus.error) diagEl.append(el("div", null, "renderer: " + charStatus.renderer));
 
   // The collapsed list's whole job, and the reason it is allowed to be collapsed: the count is on
@@ -1541,36 +1770,94 @@ function render() {
   gateNEl.textContent = fleetErr ? "?" : String(waiting);
   gateEl.classList.toggle("wait", !fleetErr && waiting > 0);
 
-  // Waiting first, because that is the whole point of the product. Then most recent.
-  //
-  // Built as DOM nodes with textContent, not as an HTML string. Session names, working directories
-  // and now the notification message are all external text, and two of the three can carry model
-  // output; textContent cannot be talked into being markup, whereas an escaper is one forgotten
-  // call away from being wrong.
+  drawRows();
+}
+
+// While the pointer is down on the list the rows are left as they are, and drawn again a moment after
+// it comes up. Every poll replaces every row, and a pin is a button in one of them: a poll that lands
+// between the press and the release removes the button the press began on, and the click goes with it.
+// About a press in thirty would be lost to a poll every three seconds, which is a pin that sometimes
+// does nothing. The wait after the release is what lets the click land on the button first, and a
+// press that never reports its release is let go of after two seconds, because a list that stopped
+// updating for ever would be worse than a click that was lost.
+let rowsHeld = false, rowsOwed = false, rowsHeldAt = 0;
+rowsEl.addEventListener("pointerdown", () => {
+  rowsHeld = true;
+  rowsHeldAt = Date.now();
+});
+for (const end of ["pointerup", "pointercancel"]) {
+  window.addEventListener(end, () => {
+    if (!rowsHeld) return;
+    setTimeout(() => {
+      rowsHeld = false;
+      if (rowsOwed) drawRows();
+    }, 80);
+  });
+}
+
+// The rows in the order Rust sent them (`fleet::shown`): waiting, then pinned, then busy, then the
+// rest, each newest first. The page does not sort them, and `pet_page` fails if it does.
+//
+// Built as DOM nodes with textContent, not as an HTML string. Session names, working directories
+// and now the notification message are all external text, and two of the three can carry model
+// output; textContent cannot be talked into being markup, whereas an escaper is one forgotten
+// call away from being wrong.
+function drawRows() {
+  if (rowsHeld && Date.now() - rowsHeldAt < 2000) {
+    rowsOwed = true;
+    return;
+  }
+  rowsOwed = false;
   rowsEl.replaceChildren(
-    ...sessions
-      .slice()
-      .sort((a, b) => (b.waiting ? 1 : 0) - (a.waiting ? 1 : 0) || b.startedAt - a.startedAt)
-      .map((s) => {
-        const name = s.name || s.cwd.split("\\").pop() || s.sessionId.slice(0, 8);
-        // Rust decides whether there is a line to show and how long it may be (fleet::asking_line).
-        // The page only asks whether it got one.
-        const asking = s.waiting ? s.waitingMessage : null;
+    ...sessions.map((s) => {
+      const name = s.name || s.cwd.split("\\").pop() || s.sessionId.slice(0, 8);
+      // Rust decides whether there is a line to show and how long it may be (fleet::asking_line).
+      // The page only asks whether it got one.
+      const asking = s.waiting ? s.waitingMessage : null;
 
-        const row = el("div", "row" + (s.waiting ? " wait" : "") + (s.cwd === HERE ? " here" : ""));
-        row.append(el("span", "st", s.waiting ? "waiting" : s.status));
+      const row = el("div", "row" + (s.waiting ? " wait" : "") + (s.cwd === HERE ? " here" : ""));
+      row.append(pinButton(s));
+      row.append(relayButton(s));
+      row.append(el("span", "st", s.waiting ? "waiting" : s.status));
 
-        const mid = el("div", "mid");
-        const nm = el("span", "nm", name);
-        nm.title = asking || s.cwd;
-        mid.append(nm);
-        if (asking) mid.append(el("div", "ask", asking));
-        row.append(mid);
+      const mid = el("div", "mid");
+      const nm = el("span", "nm", name);
+      nm.title = asking || s.cwd;
+      mid.append(nm);
+      if (asking) mid.append(el("div", "ask", asking));
+      row.append(mid);
 
-        row.append(el("span", "ag", s.waiting && s.waitingSince ? age(s.waitingSince) : age(s.startedAt)));
-        return row;
-      }),
+      row.append(el("span", "ag", s.waiting && s.waitingSince ? age(s.waitingSince) : age(s.startedAt)));
+      return row;
+    }),
   );
+}
+
+function pinButton(s) {
+  const b = el("button", "pin");
+  b.type = "button";
+  b.setAttribute("aria-pressed", String(s.pinned === true));
+  b.title = s.pinned ? "取消釘選" : "釘在最上面";
+  b.setAttribute("aria-label", b.title);
+  b.addEventListener("click", () => pin(s.sessionId, !s.pinned));
+  return b;
+}
+
+// A row's 轉話. It opens the relay sheet on that row with an empty field, and that is all: sending is
+// the sheet's 送出. A row with no name gets a button that cannot be pressed, and says why.
+function relayButton(s) {
+  const b = el("button", "relay");
+  b.type = "button";
+  b.disabled = !s.name;
+  b.title = s.name ? "轉話給這個 session" : "沒有名字的 session 轉不了";
+  b.setAttribute("aria-label", b.title);
+  b.addEventListener("click", () => {
+    invoke("relay_open", { sessionId: s.sessionId }).catch((e) => {
+      openErr = String(e);
+      render();
+    });
+  });
+  return b;
 }
 
 poll();
@@ -1640,6 +1927,7 @@ setTimeout(async () => {
       panelFrac: panelRegions().map((g) => [g.x, g.y, g.w, g.h].map((v) => +v.toFixed(4))),
       fleetError: fleetErr,
       sessions: sessions.length,
+      pinned: sessions.filter((s) => s.pinned).length,
       waiting: sessions.filter((s) => s.waiting).length,
       waitingIds: sessions.filter((s) => s.waiting).map((s) => s.sessionId),
       statuses: [...statuses],
@@ -1648,6 +1936,277 @@ setTimeout(async () => {
     },
   }).catch((e) => console.error(e));
 }, 2500);
+
+// ---------------------------------------------------------------- the relay
+
+// Passing a message to another Claude session (Docs/DESIGN_Pet.md 6.2). Rust owns it
+// (src-tauri/src/relay.rs): the draft, its revision, the target, the timers and the outcome. This
+// draws the view it is sent and hands back what a click says: a row to open, the row picked and the
+// field's text when 送出 is pressed, and a dismissal. No key, timer, transcript or core event
+// approves, and `pet_page` fails if one starts to. Everything shown is set with textContent: the
+// names are other sessions', the text is the model's or the user's, and a detail can be the core's.
+let relayView = { state: "idle" };
+// What the page keeps of one draft between views: the row picked, whether the list is open, the
+// field, its count, and the line a refusal is said on. A redraw of the same draft keeps them, so a
+// refusal that redraws the sheet does not lose what the user typed or what Rust said.
+let relayDraft = null;
+let relayTick = null;
+const RELAY_WHY_NOT = {
+  unnamed: "沒有名字，轉不了",
+  sameTitle: "有同名的，分不出是哪一個",
+  unsendable: "名字有換行或太長，轉不了",
+};
+
+function onRelayState(v) {
+  if (!v || typeof v.state !== "string") {
+    console.error("relay-state: " + JSON.stringify(v));
+    return;
+  }
+  const opening = relayView.state === "idle" || (v.state === "drafting" && v.draft !== relayView.draft);
+  const kept = v.state === "drafting" && relayView.state === "drafting" && v.revision === relayView.revision;
+  relayView = v;
+  relayEl.classList.toggle("shut", v.state === "idle");
+  if (v.state !== "idle") {
+    // The list has a z-index and the sheet has none, so the two never show at once, and a history
+    // left open would lie over the sheet's lower half.
+    panelEl.classList.add("shut");
+    gateEl.classList.remove("open");
+    if (opening && Chat.surface() === Chat.Surface.Log) Chat.setSurface(Chat.Surface.Bubble);
+  }
+  if (!kept) drawRelay(v, false);
+  reportRegions();
+}
+
+function drawRelay(v, local) {
+  clearInterval(relayTick);
+  relayTick = null;
+  if (v.state === "drafting") return drawDraft(v, local);
+  relayDraft = null;
+  if (v.state === "sending") return drawSending(v);
+  if (v.state === "done") return drawDone(v);
+  relayEl.replaceChildren();
+}
+
+function relayWhere(t) {
+  return [t.cwd, t.status, typeof t.startedAt === "number" ? age(t.startedAt) : null].filter(Boolean).join(" · ");
+}
+
+function relayButtons(...buttons) {
+  const act = el("div", "relay-act");
+  act.append(...buttons);
+  return act;
+}
+
+function relayKey(label, cls) {
+  const b = el("button", "relay-btn" + (cls ? " " + cls : ""), label);
+  b.type = "button";
+  return b;
+}
+
+// A send button stays unpressable until Rust takes an approval again (`armedAtMs`, relay.rs
+// `SETTLE`), so a click aimed at the sheet as it was cannot land on the one that just replaced it.
+// Rust refuses such a click either way; this keeps the button from looking pressable meanwhile.
+function relaySettle(button, armedAtMs) {
+  const wait = armedAtMs - Date.now();
+  if (wait <= 0 || button.disabled) return;
+  button.disabled = true;
+  setTimeout(() => { button.disabled = false; }, wait);
+}
+
+// A redraw the page makes itself (a row picked, the list opened) moves 送出 as a view from Rust
+// does, and Rust does not hear of it, so the page holds the button for as long as Rust would
+// (relay.rs `SETTLE`). `relayCount` is what enables it again, by the one rule it keeps.
+const RELAY_SETTLE_MS = 800;
+function relayHold(d, untilMs) {
+  clearTimeout(d.settle);
+  d.armedAt = untilMs;
+  d.settle = setTimeout(() => {
+    d.armedAt = 0;
+    relayCount(relayView);
+  }, Math.max(0, untilMs - Date.now()));
+}
+
+// The field grows with its text, up to most of the band, so the words that leave are in view.
+function relayFit(field) {
+  field.style.height = "auto";
+  field.style.height = Math.min(field.scrollHeight + 2, 168) + "px";
+}
+
+// `local` is a redraw the page made itself, for a row picked or the list opened: the field and what
+// was typed in it stay. Any other is a view from Rust, whose text is the field's.
+function drawDraft(v, local) {
+  const rows = v.pick.kind === "rows" ? v.pick.choices : [];
+  const pickable = (id) => rows.some((c) => c.sessionId === id && !c.unpickable);
+  if (!relayDraft || relayDraft.draft !== v.draft) {
+    const field = el("textarea", "relay-field");
+    field.rows = 3;
+    field.spellcheck = false;
+    field.setAttribute("aria-label", "要轉的話");
+    field.addEventListener("input", () => {
+      relayCount(relayView);
+      relayFit(field);
+    });
+    relayDraft = { draft: v.draft, picked: null, choosing: false, field, count: el("div", "relay-meta"), refused: el("div", "relay-error"), row: null, send: null, armedAt: 0, settle: null };
+  }
+  const d = relayDraft;
+  if (!local) {
+    d.field.value = v.text;
+    d.picked = v.pick.chosen || (pickable(d.picked) ? d.picked : null);
+    d.choosing = d.picked === null;
+  }
+  const picked = rows.find((c) => c.sessionId === d.picked && !c.unpickable) || null;
+  d.row = picked;
+
+  const to = el("div", "relay-to");
+  to.append(el("span", "relay-head", "轉話給"), el("span", "relay-title", picked ? picked.title : "（還沒選）"));
+  if (picked && rows.length > 1) {
+    const other = el("button", "relay-link", d.choosing ? "收起" : "換一個");
+    other.type = "button";
+    other.addEventListener("click", () => {
+      d.choosing = !d.choosing;
+      drawRelay(relayView, true);
+    });
+    to.append(other);
+  }
+  const nodes = [to];
+  if (picked) nodes.push(el("div", "relay-where", relayWhere(picked)));
+  if (v.pick.kind === "failed") {
+    nodes.push(el("div", "relay-error", "看不到 session 清單：" + v.pick.why));
+  } else if (rows.length === 0) {
+    nodes.push(el("div", "relay-note", "現在沒有看到任何 session。"));
+  } else if (d.choosing) {
+    if (!picked) nodes.push(el("div", "relay-label", v.hint ? "你說的是「" + v.hint + "」，選一個：" : "選一個 session："));
+    const list = el("div", "relay-list");
+    for (const c of rows) {
+      const b = el("button", "relay-choice");
+      b.type = "button";
+      b.disabled = Boolean(c.unpickable);
+      b.title = c.cwd;
+      b.setAttribute("aria-pressed", String(c.sessionId === d.picked));
+      b.append(el("span", "nm", c.title || "（沒有名字）" + c.cwd.split("\\").pop()));
+      b.append(el("span", "why", c.unpickable ? RELAY_WHY_NOT[c.unpickable] || c.unpickable : c.matched ? "你說的" : c.status));
+      b.addEventListener("click", () => {
+        d.picked = c.sessionId;
+        d.choosing = false;
+        drawRelay(relayView, true);
+      });
+      list.append(b);
+    }
+    nodes.push(list);
+  }
+  // The field comes before the fixed words, so what 送出 sends is in view without scrolling at
+  // every figure size: the band is 148 px at --figure 1.3, and the buttons are always in it.
+  nodes.push(d.field, d.count);
+  nodes.push(el("div", "relay-label", "送過去時前面會加這段（標題「" + v.summary + "」）："));
+  nodes.push(el("div", "relay-quote", v.header));
+  nodes.push(el("div", "relay-note", "送到的是對方的收件匣，它可能不讀，也可能不照做。"));
+  nodes.push(d.refused);
+  const cancel = relayKey("取消");
+  cancel.addEventListener("click", () => relayDismiss(v.revision));
+  const send = relayKey("送出", "send");
+  d.send = send;
+  relayHold(d, local ? Math.max(v.armedAtMs, Date.now() + RELAY_SETTLE_MS) : v.armedAtMs);
+  // `detail` is 0 for a click that a key or a script made, so Enter or Space on a focused 送出 does
+  // not send: only the pointer does.
+  send.addEventListener("click", (e) => { if (e.detail > 0) relayApprove(v.revision, d.picked, d.field.value, d.refused); });
+  nodes.push(relayButtons(cancel, send));
+  relayEl.replaceChildren(...nodes);
+  relayCount(v);
+  relayFit(d.field);
+}
+
+// The count under the field, and whether 送出 can be pressed: someone is picked, the text is one
+// Rust would take, and the sheet has stood still since it last moved.
+function relayCount(v) {
+  const d = relayDraft;
+  if (!d || v.state !== "drafting") return;
+  const n = [...d.field.value.trim()].length;
+  const fits = n > 0 && n <= v.textMax;
+  d.count.textContent = n + " / " + v.textMax + " 字 · 三分鐘沒按送出就收起來，不會送";
+  d.count.classList.toggle("over", !fits);
+  if (d.send) d.send.disabled = !d.row || !fits || Date.now() < d.armedAt;
+}
+
+function drawSending(v) {
+  const to = el("div", "relay-to");
+  to.append(el("span", "relay-head", "送出中"), el("span", "relay-title", v.target.title));
+  const at = v.step.step === "handing" ? 2 : v.step.step === "listing" ? 1 : 0;
+  const find = el("div", "relay-step" + (at === 1 ? " on" : at > 1 ? " done" : ""), "正在找「" + v.target.title + "」");
+  const hand = el("div", "relay-step" + (at === 2 ? " on" : ""), at === 2 ? "交給 " + v.step.to : "交給那個 session");
+  const clock = el("div", "relay-meta");
+  const tick = () => {
+    clock.textContent = "已經 " + Math.max(0, Math.round((Date.now() - v.sinceMs) / 1000)) + " 秒。送出中不能取消，也不能改。";
+  };
+  tick();
+  relayTick = setInterval(tick, 1000);
+  relayEl.replaceChildren(to, el("div", "relay-where", relayWhere(v.target)), find, hand, clock, el("div", "relay-label", "要轉的話："), el("div", "relay-sent", v.text));
+}
+
+function drawDone(v) {
+  const o = v.outcome;
+  const tone = o.kind === "delivered" ? "delivered" : o.kind === "unknown" ? "unknown" : "bad";
+  const to = el("div", "relay-to");
+  to.append(el("span", "relay-done " + tone, v.headline), el("span", "relay-title", v.target.title));
+  const nodes = [to, el("div", "relay-reason", v.reason)];
+  if (o.kind === "delivered") {
+    nodes.push(el("div", "relay-meta", "訊息編號 " + o.msg_id + (v.gated === false ? " · 核准的關卡這次沒有記到，但訊息送到了" : "")));
+  }
+  if (typeof o.detail === "string" && o.detail) nodes.push(el("div", "relay-meta", o.detail));
+  if (o.kind === "sent_other") nodes.push(el("div", "relay-label", "實際送給「" + o.to + "」的是："), el("div", "relay-sent", o.message));
+  nodes.push(el("div", "relay-label", o.kind === "sent_other" ? "你核准的是：" : "要轉的話："), el("div", "relay-sent", v.text));
+  const refused = el("div", "relay-error");
+  nodes.push(refused);
+  const close = relayKey("關閉");
+  close.addEventListener("click", () => relayDismiss(v.revision));
+  const keys = [close];
+  if (v.retry) {
+    const again = relayKey("再送一次", "send");
+    relaySettle(again, v.armedAtMs);
+    again.addEventListener("click", (e) => { if (e.detail > 0) relayApprove(v.revision, v.target.sessionId, v.text, refused); });
+    keys.push(again);
+  }
+  nodes.push(relayButtons(...keys));
+  relayEl.replaceChildren(...nodes);
+}
+
+// The one place the page asks Rust to send, called only from the two click handlers above. Rust checks
+// the revision, the row and the text again, and a refusal is said on the sheet.
+function relayApprove(revision, sessionId, text, refusedEl) {
+  refusedEl.textContent = "";
+  invoke("relay_approve", { revision, sessionId, text }).catch((e) => {
+    refusedEl.textContent = String(e);
+  });
+}
+
+function relayDismiss(revision) {
+  invoke("relay_dismiss", { revision }).catch((e) => console.error("relay_dismiss: " + String(e)));
+}
+
+// Escape is 取消, or 關閉 on an outcome. No key sends: Enter in the field is a new line, which is the
+// field's own behaviour, and the send buttons ignore a click a key made.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || e.isComposing) return;
+  if (relayView.state === "drafting" || relayView.state === "done") relayDismiss(relayView.revision);
+});
+
+// After the character, wrapped, and with the listener before the question, for the reasons the core's
+// wiring gives. A relay that cannot be wired leaves everything else working. The answer to the
+// question is used only when no event has come since it was asked, because an event is newer.
+let relayHeard = false;
+try {
+  window.__TAURI__.event
+    .listen("relay-state", (e) => {
+      relayHeard = true;
+      onRelayState(e.payload);
+    })
+    .then(() => invoke("relay_state"))
+    .then((v) => {
+      if (!relayHeard) onRelayState(v);
+    })
+    .catch((e) => console.error("relay wiring: " + String(e)));
+} catch (e) {
+  console.error("relay wiring: " + String(e));
+}
 </script>
 </body>
 </html>

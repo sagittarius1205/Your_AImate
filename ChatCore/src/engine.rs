@@ -12,10 +12,12 @@
 // thing between the first sentence and the thread reading it.
 
 use crate::character::{Character, Greeting, VoiceId};
+use crate::chat::{self, ChatEnv, History};
 use crate::claude::{self, Failure, Proc, StartError};
 use crate::pace::{Measured, Pace};
 use crate::protocol::Event;
-use crate::reply::{self, Atom};
+use crate::relay::Fact;
+use crate::reply::{self, Atom, RelayAsk, Relaying};
 use crate::scratch;
 use crate::voice::{Speaker, Voice};
 use std::ffi::OsString;
@@ -32,6 +34,8 @@ pub enum Engine {
     /// because with no `claude` to be found the character still has something to do.
     Echo,
     Claude,
+    /// An OpenAI-compatible service over HTTP (`chat.rs`).
+    Openai,
 }
 
 impl Engine {
@@ -39,6 +43,7 @@ impl Engine {
         match name {
             "echo" => Some(Engine::Echo),
             "claude" => Some(Engine::Claude),
+            "openai" => Some(Engine::Openai),
             _ => None,
         }
     }
@@ -47,9 +52,12 @@ impl Engine {
 pub struct Config {
     /// `None` is "whichever can be had": `claude` when it can be found, echo when it cannot.
     pub engine: Option<Engine>,
+    /// `claude`'s model.
     pub model: String,
     /// Where `claude` is looked for, best first.
     pub claude: Vec<OsString>,
+    /// The HTTP engine's service, read only when that engine runs.
+    pub chat: ChatEnv,
     /// Holds the engine's working directory. Owned by the caller, who removes it.
     pub scratch: PathBuf,
     /// How long the engine takes to come up, as a delay before it starts. It exists so the queue
@@ -59,6 +67,9 @@ pub struct Config {
     pub turn_timeout: Duration,
     /// Gives every turn its voice, whichever engine wrote it.
     pub speaker: Speaker,
+    /// Whether the character is offered a way to ask for a relay. Only the `claude` engine is
+    /// offered it for now: what a local model makes of the rule has not been measured.
+    pub relaying: Relaying,
 }
 
 /// Where the engine's events go. Returns `Err` when they cannot go anywhere (the client closed
@@ -75,6 +86,18 @@ enum Job {
     Character(Character),
     /// She says this in the current voice, and the model is not asked.
     Greet(Greeting),
+    /// How the last relay ended, for the next sentence.
+    Relayed(Fact),
+}
+
+/// What the courier holds to tell the character how a relay ended. It can queue nothing else.
+#[derive(Clone)]
+pub struct Noter(Sender<Job>);
+
+impl Noter {
+    pub fn note(&self, fact: Fact) {
+        let _ = self.0.send(Job::Relayed(fact));
+    }
 }
 
 pub struct Handle {
@@ -116,6 +139,11 @@ impl Handle {
         self.submit(Job::Greet(greeting))
     }
 
+    /// `None` once the engine has been closed.
+    pub fn noter(&self) -> Option<Noter> {
+        self.jobs.as_ref().map(|jobs| Noter(jobs.clone()))
+    }
+
     fn submit(&self, job: Job) -> Result<(), String> {
         match &self.jobs {
             Some(jobs) => jobs.send(job).map_err(|_| "the engine has stopped".to_string()),
@@ -150,6 +178,8 @@ enum Backend {
     /// `None` between processes: before the first one comes up, and after one is given up on. The
     /// next sentence starts another.
     Claude { proc: Option<Proc> },
+    /// The service remembers nothing, so the conversation so far is held here.
+    Openai { client: chat::Client, history: History },
 }
 
 fn work(config: &Config, queue: &Receiver<Job>, stop: &AtomicBool, sink: &Sink) {
@@ -158,12 +188,28 @@ fn work(config: &Config, queue: &Receiver<Job>, stop: &AtomicBool, sink: &Sink) 
     let mut backend = boot(config, &character);
     // One for the life of the engine, so what one turn learns about the speech service paces the next.
     let mut pace = Pace::START;
+    // How the last relay ended, put in front of each sentence until a model has answered one.
+    let mut note: Option<Fact> = None;
     for job in queue {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         let sent = match job {
-            Job::Say(text) => say(&text, &mut backend, &character, &mut pace, config, stop, sink),
+            Job::Say(text) => {
+                let text = match (note, &backend) {
+                    (Some(fact), Backend::Claude { .. } | Backend::Openai { .. }) => format!("{}\n{text}", reply::note(fact)),
+                    _ => text,
+                };
+                say(&text, &mut backend, &character, &mut pace, config, stop, sink).map(|answered| {
+                    if answered {
+                        note = None;
+                    }
+                })
+            }
+            Job::Relayed(fact) => {
+                note = Some(fact);
+                Ok(())
+            }
             Job::Greet(greeting) => speak(&reply::echo(greeting.into_text()), &mut pace, &config.speaker, character.voice(), stop, sink),
             Job::Character(next) => {
                 change_character(&mut character, next, &mut backend, config);
@@ -184,8 +230,9 @@ fn work(config: &Config, queue: &Receiver<Job>, stop: &AtomicBool, sink: &Sink) 
     }
 }
 
-/// One sentence, answered and sent.
-fn say(text: &str, backend: &mut Backend, character: &Character, pace: &mut Pace, config: &Config, stop: &AtomicBool, sink: &Sink) -> Result<(), Halt> {
+/// One sentence, answered and sent. `Ok(false)` is a sentence the engine failed to answer: the
+/// client has been told, and the engine may not have heard it.
+fn say(text: &str, backend: &mut Backend, character: &Character, pace: &mut Pace, config: &Config, stop: &AtomicBool, sink: &Sink) -> Result<bool, Halt> {
     let turn = match backend {
         Backend::Echo { .. } => Turn::Said(reply::echo(text.to_string())),
         Backend::Claude { proc } => {
@@ -194,36 +241,65 @@ fn say(text: &str, backend: &mut Backend, character: &Character, pace: &mut Pace
             eprintln!("vrchatcore: claude answered in {:.0} ms", began.elapsed().as_secs_f64() * 1000.0);
             turn
         }
+        Backend::Openai { client, history } => {
+            let began = Instant::now();
+            let sent = history.len();
+            let turn = openai_turn(client, history, character, text, stop);
+            eprintln!(
+                "vrchatcore: openai answered in {:.0} ms ({sent} turns of history sent{})",
+                began.elapsed().as_secs_f64() * 1000.0,
+                match &turn {
+                    Turn::Failed(why) => format!(", failed: {why}"),
+                    _ => String::new(),
+                }
+            );
+            turn
+        }
     };
+    let answered = !matches!(turn, Turn::Failed(_));
     match turn {
         Turn::Said(atoms) => speak(&atoms, pace, &config.speaker, character.voice(), stop, sink),
+        // Her clauses are dropped: nothing she wrote this turn is said, so nothing she wrote can
+        // claim an outcome. The pet answers in fixed words.
+        Turn::Relay(ask) => send(&Event::RelayAsked { to: ask.to().to_string(), text: ask.text().to_string() }, stop, sink)
+            .and_then(|()| send(&Event::TurnEnd, stop, sink)),
         Turn::Failed(why) => send(&error(why), stop, sink),
         Turn::Stopped => Err(Halt::Stopped),
     }
     .and_then(|()| match backend {
         // After the echo and not before, so it is the last thing the client shows.
         Backend::Echo { notice } => notice.take().map_or(Ok(()), |message| send(&Event::Error { message }, stop, sink)),
-        Backend::Claude { .. } => Ok(()),
+        Backend::Claude { .. } | Backend::Openai { .. } => Ok(()),
     })
+    .map(|()| answered)
 }
 
-/// Makes `next` the character. The resident `claude` was started with the previous one's prompt
-/// and cannot be told another, so when the prompt differs it is replaced now, between jobs, and
-/// not at the next sentence, which would pay for the start. A change of voice alone costs nothing.
+/// Makes `next` the character. A new prompt is someone else, who does not remember what the last
+/// one was told. The resident `claude` was started with the previous prompt and cannot be told
+/// another, so it is replaced now, between jobs, and not at the next sentence, which would pay for
+/// the start; the HTTP engine's history is emptied. A change of voice alone is the same character
+/// and costs nothing.
 fn change_character(current: &mut Character, next: Character, backend: &mut Backend, config: &Config) {
-    let new_prompt = reply::prompt(&next) != reply::prompt(current);
-    eprintln!(
-        "vrchatcore: character is now {} (voice {}){}",
-        next.name(),
-        next.voice().as_str(),
-        if new_prompt { ", and claude is restarted" } else { "" }
-    );
+    let new_prompt = reply::prompt(&next, config.relaying) != reply::prompt(current, config.relaying);
+    let what = match backend {
+        Backend::Claude { .. } => ", and claude is restarted",
+        Backend::Openai { .. } => ", and the history is cleared",
+        Backend::Echo { .. } => "",
+    };
+    eprintln!("vrchatcore: character is now {} (voice {}){}", next.name(), next.voice().as_str(), if new_prompt { what } else { "" });
     *current = next;
-    if let (true, Backend::Claude { proc }) = (new_prompt, backend) {
-        if let Some(old) = proc.take() {
-            old.close();
+    if !new_prompt {
+        return;
+    }
+    match backend {
+        Backend::Claude { proc } => {
+            if let Some(old) = proc.take() {
+                old.close();
+            }
+            *proc = launch(config, current).map_err(|e| eprintln!("vrchatcore: {}", e.describe())).ok();
         }
-        *proc = launch(config, current).map_err(|e| eprintln!("vrchatcore: {}", e.describe())).ok();
+        Backend::Openai { history, .. } => history.clear(),
+        Backend::Echo { .. } => {}
     }
 }
 
@@ -327,6 +403,14 @@ fn boot(config: &Config, character: &Character) -> Backend {
             Backend::Echo { notice: None }
         }
         Some(Engine::Claude) => Backend::Claude { proc: launch(config, character).map_err(|e| eprintln!("vrchatcore: {}", e.describe())).ok() },
+        Some(Engine::Openai) => {
+            let client = chat::Client::new(&config.chat, &|name| std::env::var_os(name), config.turn_timeout);
+            match client.service() {
+                Ok(service) => eprintln!("vrchatcore: engine openai, model {} at {}", service.model(), service.url()),
+                Err(why) => eprintln!("vrchatcore: engine openai cannot run, and every sentence will say why: {why}"),
+            }
+            Backend::Openai { client, history: History::default() }
+        }
         None => match launch(config, character) {
             Ok(proc) => Backend::Claude { proc: Some(proc) },
             Err(error @ StartError::NotFound(_)) => {
@@ -349,7 +433,8 @@ fn boot(config: &Config, character: &Character) -> Backend {
 fn launch(config: &Config, character: &Character) -> Result<Proc, StartError> {
     let cwd = scratch::engine_dir(&config.scratch)
         .map_err(|e| StartError::Failed(format!("could not make a working directory for claude under {}: {e}", config.scratch.display())))?;
-    let proc = claude::start(&config.claude, &cwd, &config.model, character, config.speaker.key_env())?;
+    let withheld: Vec<&std::ffi::OsStr> = [config.speaker.key_env(), config.chat.key_env()].into_iter().flatten().collect();
+    let proc = claude::start(&config.claude, &cwd, &config.model, character, config.relaying, &withheld)?;
     eprintln!("vrchatcore: engine claude started, model {}, working in {}", config.model, cwd.display());
     Ok(proc)
 }
@@ -361,10 +446,28 @@ fn error(message: String) -> Event {
 /// What an engine made of one sentence.
 enum Turn {
     Said(Vec<Atom>),
+    /// She asked for a relay, and said nothing that will be heard.
+    Relay(RelayAsk),
     /// The reason, which the client is told as an `error`.
     Failed(String),
     /// The core is shutting down, so nothing is said.
     Stopped,
+}
+
+/// One sentence through the HTTP engine. The turn joins the history only once `parse` has taken
+/// the answer.
+fn openai_turn(client: &chat::Client, history: &mut History, character: &Character, text: &str, stop: &AtomicBool) -> Turn {
+    match client.ask(&reply::prompt(character, Relaying::Off), history, text, stop) {
+        Ok(answered) => match reply::parse(&answered, Relaying::Off) {
+            Ok(reply) => {
+                history.push(text, &answered);
+                Turn::Said(reply.atoms())
+            }
+            Err(why) => Turn::Failed(why),
+        },
+        Err(Failure::Stopped) => Turn::Stopped,
+        Err(Failure::Broken(why)) => Turn::Failed(why),
+    }
 }
 
 /// One sentence through `claude`.
@@ -387,8 +490,11 @@ fn claude_turn(slot: &mut Option<Proc>, config: &Config, character: &Character, 
         return Turn::Failed("claude is not running".to_string());
     };
     match proc.ask(text, config.turn_timeout, stop) {
-        Ok(message) => match claude::answer(&message) {
-            Ok(reply) => Turn::Said(reply.atoms()),
+        Ok(message) => match claude::answer(&message, config.relaying) {
+            Ok(reply) => match reply.relay {
+                Some(ask) => Turn::Relay(ask),
+                None => Turn::Said(reply.atoms()),
+            },
             Err(why) => Turn::Failed(why),
         },
         Err(Failure::Stopped) => Turn::Stopped,
