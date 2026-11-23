@@ -5158,7 +5158,7 @@ fn the_defaults_are_the_designs(c: &mut Checks) {
         "switches": { "voice": true, "fillers": true, "mic": true, "follow": true, "on_top": true, "autostart": false, "record": false },
         "speech": { "kind": "local" },
         "stt": { "pack": "sense-voice-zh-en-ja-ko-yue-int8-2024-07-17" },
-        "chat": { "kind": "claude", "model": "haiku" },
+        "chat": { "kind": "claude", "model": "sonnet" },
         "look": { "bubble_opacity": 0.92, "font_size": 13, "theme": "paper" },
         "settings_tab": "character",
     });
@@ -5324,6 +5324,12 @@ fn a_chat_service_is_checked_and_an_old_chat_model_still_reads(c: &mut Checks) {
         let (read, problems) = file_parse(&json!({ "chat_model": old }));
         c.eq((read.chat, problems), (settings::Chat::Claude { model }, Vec::new()), format!("an old file's chat_model {old} is claude {old}, with nothing to say"));
     }
+    let (read, problems) = file_parse(&json!({ "volume": 0.4 }));
+    c.eq((read.chat, problems), (settings::Chat::Claude { model: settings::ClaudeModel::Sonnet }, Vec::new()), "a file that saved no model is sonnet, with nothing to say");
+    let (read, problems) = file_parse(&json!({ "chat": { "kind": "claude", "model": "haiku" } }));
+    c.eq((read.chat, problems), (settings::Chat::Claude { model: settings::ClaudeModel::Haiku }, Vec::new()), "and a saved haiku stays haiku");
+    let (read, problems) = file_parse(&json!({ "chat": { "kind": "claude", "model": "opus" } }));
+    c.that(read.chat == settings::Chat::Claude { model: settings::ClaudeModel::Sonnet } && problems.iter().any(|p| p.field == "chat.model"), format!("a model that is neither falls back to sonnet and says so: {problems:?}"));
     let both = json!({ "chat_model": "sonnet", "chat": { "kind": "openai", "url": settings::OLLAMA_URL, "model": "gemma4:12b" } });
     let (read, problems) = file_parse(&both);
     c.eq(
@@ -5334,9 +5340,9 @@ fn a_chat_service_is_checked_and_an_old_chat_model_still_reads(c: &mut Checks) {
 
     let home = temp_home("old-chat");
     let file = home.0.join(settings::FILE);
-    let _ = std::fs::write(&file, r#"{"chat_model":"sonnet","volume":0.4}"#);
+    let _ = std::fs::write(&file, r#"{"chat_model":"haiku","volume":0.4}"#);
     let store = settings::Store::open(Some(home.0.clone()));
-    c.eq(store.current().chat, settings::Chat::Claude { model: settings::ClaudeModel::Sonnet }, "the store reads the old file the same way");
+    c.eq(store.current().chat, settings::Chat::Claude { model: settings::ClaudeModel::Haiku }, "the store reads the old file the same way");
     let mut request = store.current().to_value();
     c.eq(request.get("chat_model"), None, "and what the window is sent has chat and no chat_model");
     request["chat"] = json!({ "kind": "openai", "url": settings::OLLAMA_URL, "model": "llama3.1:8b-instruct-q4_K_M", "key_env": "" });
@@ -5427,7 +5433,7 @@ fn the_file_round_trips_and_keeps_what_it_does_not_know(c: &mut Checks) {
 
     let mut request = first.settings.to_value();
     request["volume"] = json!(0.3);
-    request["chat"] = json!({ "kind": "claude", "model": "sonnet" });
+    request["chat"] = json!({ "kind": "claude", "model": "haiku" });
     request["switches"]["follow"] = json!(false);
     let set = store.set(&request);
     c.that(set.is_ok(), format!("a whole request is saved: {set:?}"));
@@ -5436,7 +5442,7 @@ fn the_file_round_trips_and_keeps_what_it_does_not_know(c: &mut Checks) {
     c.eq(raw.get("theme"), Some(&json!("dark")), "a key this version does not know is kept");
     c.eq(raw.pointer("/scale/later"), Some(&json!(true)), "at any depth");
     c.eq(raw.get("volume"), Some(&json!(0.3)), "and the change is written");
-    c.eq(raw.get("chat"), Some(&json!({ "kind": "claude", "model": "sonnet" })), "every change");
+    c.eq(raw.get("chat"), Some(&json!({ "kind": "claude", "model": "haiku" })), "every change");
     c.eq(raw.pointer("/switches/follow"), Some(&json!(false)), "nested ones too");
     c.eq(raw.get("character"), Some(&json!("char-20261107")), "and her choice is still there");
     c.that(!home.0.join(format!("{}.new", settings::FILE)).exists(), "nothing is left beside the file");
@@ -5998,8 +6004,8 @@ fn the_characters_folder_is_made_when_opened(c: &mut Checks) {
 /// Item 1: which child a change restarts, and the environment it restarts with.
 fn a_change_of_model_restarts_the_child_that_reads_it(c: &mut Checks) {
     let before = Settings::default();
-    let mut sonnet = before.clone();
-    sonnet.chat = settings::Chat::Claude { model: settings::ClaudeModel::Sonnet };
+    let mut haiku = before.clone();
+    haiku.chat = settings::Chat::Claude { model: settings::ClaudeModel::Haiku };
     let mut ollama = before.clone();
     ollama.chat = settings::Chat::Openai { url: settings::OLLAMA_URL.into(), model: "gemma4:12b".into(), key_env: None };
     let mut openai = before.clone();
@@ -6020,12 +6026,12 @@ fn a_change_of_model_restarts_the_child_that_reads_it(c: &mut Checks) {
     louder.scale.window = 1.4;
     louder.scale.figure = 1.2;
 
-    let r = settings::restarts(&before, &sonnet);
-    c.that(r.core.as_deref().is_some_and(|w| w.contains("sonnet")) && r.stt.is_none(), format!("the chat model restarts the core and says to what: {r:?}"));
+    let r = settings::restarts(&before, &haiku);
+    c.that(r.core.as_deref().is_some_and(|w| w.contains("haiku")) && r.stt.is_none(), format!("the chat model restarts the core and says to what: {r:?}"));
     let r = settings::restarts(&before, &ollama);
     c.that(r.core.as_deref().is_some_and(|w| w.contains("gemma4:12b")) && r.stt.is_none(), format!("so does a chat service, named by its model: {r:?}"));
     let r = settings::restarts(&ollama, &before);
-    c.that(r.core.as_deref().is_some_and(|w| w.contains("Claude haiku")), format!("and going back to claude: {r:?}"));
+    c.that(r.core.as_deref().is_some_and(|w| w.contains("Claude sonnet")), format!("and going back to claude: {r:?}"));
     let r = settings::restarts(&before, &remote);
     c.that(r.core.as_deref().is_some_and(|w| w.contains("https://tts.example.com/v1")) && r.stt.is_none(), format!("a custom voice restarts the core: {r:?}"));
     let r = settings::restarts(&remote, &before);
@@ -6037,7 +6043,7 @@ fn a_change_of_model_restarts_the_child_that_reads_it(c: &mut Checks) {
 
     let env = |s: &Settings| crate::core::env(s).into_iter().collect::<std::collections::BTreeMap<_, _>>();
     let local = env(&before);
-    c.eq(local.get("VRCHATCORE_MODEL").cloned().flatten().as_deref(), Some("haiku"), "claude's model is set when claude answers");
+    c.eq(local.get("VRCHATCORE_MODEL").cloned().flatten().as_deref(), Some("sonnet"), "claude's model is set when claude answers, and with nothing chosen it is sonnet");
     for name in ["VRCHATCORE_ENGINE", "VRCHATCORE_CHAT_URL", "VRCHATCORE_CHAT_MODEL", "VRCHATCORE_CHAT_KEY_ENV"] {
         c.eq(local.get(name).cloned(), Some(None), format!("and claude removes {name}, so the core may fall back to echo and say why"));
     }
@@ -6056,7 +6062,7 @@ fn a_change_of_model_restarts_the_child_that_reads_it(c: &mut Checks) {
     c.eq(far.get("VRCHATCORE_SPEECH_MODEL").cloned().flatten().as_deref(), Some("tts-1"), "its model");
     c.eq(far.get("VRCHATCORE_SPEECH_VOICE").cloned().flatten().as_deref(), Some("nova"), "its voice");
     c.eq(far.get("VRCHATCORE_SPEECH_KEY_ENV").cloned().flatten().as_deref(), Some("MY_TTS_KEY"), "and the NAME of its key's variable");
-    c.eq(env(&sonnet).get("VRCHATCORE_MODEL").cloned().flatten().as_deref(), Some("sonnet"), "sonnet is passed as sonnet");
+    c.eq(env(&haiku).get("VRCHATCORE_MODEL").cloned().flatten().as_deref(), Some("haiku"), "haiku is passed as haiku");
 
     // The key itself is never the pet's to move: set in the pet's environment, it is in nothing the
     // pet writes, sends or hands the core, and the core reads it on its own.

@@ -11,9 +11,11 @@ use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Which `claude` model the character runs on when `VRCHATCORE_MODEL` does not say. The one the
-/// numbers in Docs/DESIGN_ChatCore.md were measured on.
-const DEFAULT_MODEL: &str = "haiku";
+/// Which `claude` model the character runs on when `VRCHATCORE_MODEL` does not say. Sonnet since
+/// 2026-11-24: haiku wrote a wrong or Simplified character in 5 of 20 turns, sonnet in none of 6, and
+/// sonnet was not slower (Docs/DESIGN_ChatCore.md section 14). The older timings in that document were
+/// taken on haiku. The relay's courier keeps its own model, `relay::MODEL`.
+pub const DEFAULT_MODEL: &str = "sonnet";
 pub const MODEL_ENV: &str = "VRCHATCORE_MODEL";
 
 fn emit(out: &mut impl Write, event: &Event) -> Result<(), String> {

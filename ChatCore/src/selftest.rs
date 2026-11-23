@@ -448,6 +448,7 @@ const SCENARIOS: &[Scenario] = &[
     ("claude_runs_in_an_empty_directory_of_the_cores_own_making", claude_runs_in_an_empty_directory_of_the_cores_own_making),
     ("claude_is_started_with_the_measured_flags_intact", claude_is_started_with_the_measured_flags_intact),
     ("the_model_can_be_chosen_by_environment", the_model_can_be_chosen_by_environment),
+    ("a_core_told_no_model_asks_claude_for_sonnet", a_core_told_no_model_asks_claude_for_sonnet),
     ("a_claude_answer_reaches_the_wire_with_its_gestures_as_tags", a_claude_answer_reaches_the_wire_with_its_gestures_as_tags),
     ("a_bracket_in_a_claude_clause_rejects_the_turn", a_bracket_in_a_claude_clause_rejects_the_turn),
     ("a_gesture_outside_the_vocabulary_rejects_the_turn", a_gesture_outside_the_vocabulary_rejects_the_turn),
@@ -690,7 +691,7 @@ fn claude_is_started_with_the_measured_flags_intact() -> Result<String, String> 
         }
         want("--input-format", "stream-json")?;
         want("--output-format", "stream-json")?;
-        want("--model", "haiku")?;
+        want("--model", "sonnet")?;
         want("--tools", "")?;
         let tail: Vec<&str> = args.iter().rev().take(checks::ISOLATION.len()).rev().map(String::as_str).collect();
         if tail != checks::ISOLATION {
@@ -726,6 +727,23 @@ fn the_model_can_be_chosen_by_environment() -> Result<String, String> {
         client.shutdown()?;
         Ok(String::new())
     })
+}
+
+fn a_core_told_no_model_asks_claude_for_sonnet() -> Result<String, String> {
+    // An empty variable names no model, the same as one that is not set.
+    for (name, model) in [("nomodel", None), ("emptymodel", Some(""))] {
+        with_stub_model(name, model, |client| {
+            let start = client.wait_for_start(1)?;
+            let args = start["args"].as_array().cloned().unwrap_or_default();
+            let at = args.iter().position(|a| a == "--model").ok_or("no --model in the stand-in's arguments")?;
+            if args.get(at + 1) != Some(&json!("sonnet")) {
+                return Err(format!("with {model:?} for the model, --model should be followed by \"sonnet\", saw {:?}", args.get(at + 1)));
+            }
+            client.shutdown()?;
+            Ok(())
+        })?;
+    }
+    Ok(String::new())
 }
 
 fn a_claude_answer_reaches_the_wire_with_its_gestures_as_tags() -> Result<String, String> {
@@ -2743,7 +2761,7 @@ fn a_turn_is_kept_only_when_its_say_asks_and_only_where_it_says() -> Result<Stri
     if lines.len() != 3 {
         return Err(format!("three turns asked to be kept, the file has {} lines: {lines:?}", lines.len()));
     }
-    let engine = json!({ "kind": "claude", "model": "haiku" });
+    let engine = json!({ "kind": "claude", "model": serve::DEFAULT_MODEL });
     let ok_reply = json!({ "clauses": ["收到", "我在這裡"], "language": "zh-TW", "affect": "calm" });
     let user = |text: &str, via: &str| json!({ "text": text, "via": via });
     let turn = |n: u64, said: Value, reply: Value, outcome: &str| json!({ "v": 1, "turn": n, "user": said, "reply": reply, "outcome": outcome, "engine": engine });
@@ -2857,7 +2875,7 @@ fn a_relay_turn_is_kept_without_what_she_asked_to_pass_on() -> Result<String, St
     if lines.len() != 2 {
         return Err(format!("two kept turns, the file has {} lines: {lines:?}", lines.len()));
     }
-    let engine = json!({ "kind": "claude", "model": "haiku" });
+    let engine = json!({ "kind": "claude", "model": serve::DEFAULT_MODEL });
     kept_as(&lines[0], json!({ "v": 1, "turn": 1, "user": { "text": "relayask", "via": "mic" }, "reply": null, "outcome": "relay_asked", "engine": engine }), "her relay turn")?;
     let reply = json!({ "clauses": ["收到", "我在這裡"], "language": "zh-TW", "affect": "calm" });
     kept_as(&lines[1], json!({ "v": 1, "turn": 2, "user": { "text": "ok", "via": "text" }, "reply": reply, "outcome": "answered", "engine": engine }), "the sentence after it, without the note")?;
@@ -2890,7 +2908,7 @@ fn a_turn_the_core_is_stopped_in_is_kept_as_interrupted() -> Result<String, Stri
     if lines.len() != 1 {
         return Err(format!("one kept turn, the file has {} lines: {lines:?}", lines.len()));
     }
-    let engine = json!({ "kind": "claude", "model": "haiku" });
+    let engine = json!({ "kind": "claude", "model": serve::DEFAULT_MODEL });
     kept_as(&lines[0], json!({ "v": 1, "turn": 1, "user": { "text": "hang", "via": "text" }, "reply": null, "outcome": "interrupted", "engine": engine }), "the turn the core was stopped in")?;
     if ms_keys(&lines[0]) != ["done"] || lines[0]["gap_ms"] != Value::Null {
         return Err(format!("a stopped turn has only done in ms, and the first turn of a core has no gap: {}", lines[0]));

@@ -208,7 +208,7 @@ impl Default for Settings {
             switches: Switches { voice: true, fillers: true, mic: true, follow: true, on_top: true, autostart: false, record: false },
             speech: Speech::Local,
             stt: SttPack { pack: DEFAULT_PACK.to_string() },
-            chat: Chat::Claude { model: ClaudeModel::Haiku },
+            chat: Chat::Claude { model: ClaudeModel::DEFAULT },
             look: Look { bubble_opacity: BUBBLE_OPACITY.default, font_size: FONT_SIZE.default as u32, theme: default_theme() },
             settings_tab: Tab::Character,
         }
@@ -382,7 +382,7 @@ impl<'a> Reader<'a> {
     /// Who answers her. A file written before `chat` existed has `chat_model` instead, which is
     /// read as the `claude` model it named; the next save writes `chat`.
     fn chat(&mut self) -> Chat {
-        let fallback = Chat::Claude { model: ClaudeModel::Haiku };
+        let fallback = Chat::Claude { model: ClaudeModel::DEFAULT };
         let given = self.root.get("chat").is_some_and(|v| !v.is_null());
         if !given && self.mode == Mode::File {
             return Chat::Claude { model: self.legacy_chat_model() };
@@ -396,7 +396,7 @@ impl<'a> Reader<'a> {
                 Some(name) => match ClaudeModel::ALL.into_iter().find(|m| m.name() == name) {
                     Some(model) => Chat::Claude { model },
                     None => {
-                        self.problem("chat.model", format!("{name:?} 不是 haiku 或 sonnet，改用 haiku"));
+                        self.problem("chat.model", format!("{name:?} 不是 haiku 或 sonnet，改用 {}", ClaudeModel::DEFAULT.name()));
                         fallback
                     }
                 },
@@ -410,14 +410,14 @@ impl<'a> Reader<'a> {
                     (Some(url), Some(model)) if self.problems.len() == before => Chat::Openai { url, model, key_env },
                     _ => {
                         if self.mode == Mode::File {
-                            self.problem("chat", "自訂聊天服務的設定不完整，改用 Claude Haiku");
+                            self.problem("chat", format!("自訂聊天服務的設定不完整，改用 Claude {}", ClaudeModel::DEFAULT.name()));
                         }
                         fallback
                     }
                 }
             }
             other => {
-                self.problem("chat.kind", format!("{other:?} 不是 claude 或 openai，改用 Claude Haiku"));
+                self.problem("chat.kind", format!("{other:?} 不是 claude 或 openai，改用 Claude {}", ClaudeModel::DEFAULT.name()));
                 fallback
             }
         }
@@ -425,11 +425,12 @@ impl<'a> Reader<'a> {
 
     fn legacy_chat_model(&mut self) -> ClaudeModel {
         match self.text("chat_model") {
-            None | Some("haiku") => ClaudeModel::Haiku,
+            None => ClaudeModel::DEFAULT,
+            Some("haiku") => ClaudeModel::Haiku,
             Some("sonnet") => ClaudeModel::Sonnet,
             Some(other) => {
-                self.problem("chat_model", format!("{other:?} 不是 haiku 或 sonnet，改用 haiku"));
-                ClaudeModel::Haiku
+                self.problem("chat_model", format!("{other:?} 不是 haiku 或 sonnet，改用 {}", ClaudeModel::DEFAULT.name()));
+                ClaudeModel::DEFAULT
             }
         }
     }
@@ -836,6 +837,10 @@ pub fn restarts(before: &Settings, after: &Settings) -> Restarts {
 
 impl ClaudeModel {
     pub const ALL: [ClaudeModel; 2] = [ClaudeModel::Haiku, ClaudeModel::Sonnet];
+
+    /// What she runs on when nothing is saved or what is saved is unusable. Sonnet since 2026-11-24,
+    /// the same as `DEFAULT_MODEL` in `ChatCore/src/serve.rs`; a saved `haiku` stays haiku.
+    pub const DEFAULT: ClaudeModel = ClaudeModel::Sonnet;
 
     /// Its name on the wire, in the file, and in `VRCHATCORE_MODEL`.
     pub fn name(self) -> &'static str {
