@@ -7,6 +7,7 @@
 use crate::character::{Character, DEFAULT_VOICE, Greeting, VoiceId};
 use crate::chat;
 use crate::claude::{self, Line, Msg, Wait};
+use crate::dialogue::{Keep, Via};
 use crate::engine::Engine;
 use crate::pace::{Measured, Pace};
 use crate::protocol::{self, Event, Request, Said};
@@ -243,8 +244,10 @@ fn result_is_decoded_in_two_layers(c: &mut Checks) {
                 Clause { text: "你好".to_string(), gesture: Gesture::Nod },
                 Clause { text: "我是小毛".to_string(), gesture: Gesture::None },
             ],
+            language: Some("zh-TW".to_string()),
+            affect: Some("calm".to_string()),
         }),
-        "the string inside the result is decoded",
+        "the string inside the result is decoded, its language and affect as written",
     );
     let as_object = json!({ "type": "result", "subtype": "success", "is_error": false, "result": serde_json::from_str::<Value>(&inner).unwrap_or_default() });
     c.rejected(claude::answer(&as_object, Relaying::Off), &["not a string", "an object"], "a result that is already an object");
@@ -1192,7 +1195,17 @@ fn the_character_and_greet_requests_are_read_and_checked_from_the_wire(c: &mut C
         Ok(Request::Greet(Greeting::new("嗨，我在這裡。").unwrap_or_else(|_| unreachable!()))),
         "a greeting",
     );
-    c.eq(protocol::parse(br#"{"op":"say","text":"hi"}"#), Ok(Request::Say { text: "hi".to_string() }), "say reads as it did");
+    c.eq(protocol::parse(br#"{"op":"say","text":"hi"}"#), Ok(Request::Say { text: "hi".to_string(), keep: None }), "say reads as it did, and keeps nothing");
+    c.eq(
+        protocol::parse(r#"{"op":"say","text":"hi","record":{"to":"X:\\pet\\dialogue.jsonl","via":"mic"}}"#.as_bytes()),
+        Ok(Request::Say { text: "hi".to_string(), keep: Some(Keep { to: PathBuf::from(r"X:\pet\dialogue.jsonl"), via: Via::Mic }) }),
+        "a say that asks for its turn to be kept names the file and how the sentence came",
+    );
+    c.eq(
+        protocol::parse(br#"{"op":"say","text":"hi","record":null}"#),
+        Ok(Request::Say { text: "hi".to_string(), keep: None }),
+        "a null record keeps nothing",
+    );
     c.eq(protocol::parse(br#"{"op":"shutdown"}"#), Ok(Request::Shutdown), "and so does shutdown");
 
     let name33 = "字".repeat(33);
@@ -1207,6 +1220,10 @@ fn the_character_and_greet_requests_are_read_and_checked_from_the_wire(c: &mut C
         (r#"{"op":"greet","text":""}"#.to_string(), "text is empty"),
         (r#"{"op":"greet"}"#.to_string(), "missing field `text`"),
         (r#"{"op":"greet","text":"[nod]嗨"}"#.to_string(), "text contains"),
+        (r#"{"op":"say","text":"hi","record":{"to":"","via":"mic"}}"#.to_string(), "record.to is empty"),
+        (r#"{"op":"say","text":"hi","record":{"to":"x.jsonl","via":"voice"}}"#.to_string(), "record.via is mic or text"),
+        (r#"{"op":"say","text":"hi","record":{"via":"text"}}"#.to_string(), "missing field `to`"),
+        (r#"{"op":"say","text":"hi","record":"x.jsonl"}"#.to_string(), "expected struct"),
     ];
     for (line, needle) in &bad {
         c.rejected(protocol::parse(line.as_bytes()), &["bad request", needle], line.chars().take(60).collect::<String>());

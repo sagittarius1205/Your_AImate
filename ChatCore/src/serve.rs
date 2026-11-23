@@ -138,7 +138,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         match protocol::parse(&buf) {
             Ok(Request::Shutdown) => return Ok(()),
-            Ok(Request::Say { text }) => reported(engine.say(text))?,
+            Ok(Request::Say { text, keep }) => reported(engine.say(text, keep))?,
             Ok(Request::Character(character)) => reported(engine.set_character(character))?,
             Ok(Request::Greet(greeting)) => reported(engine.greet(greeting))?,
             Ok(Request::Relay(order)) => match &courier {

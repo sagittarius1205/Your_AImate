@@ -14,10 +14,11 @@
 use crate::character::{Character, Greeting, VoiceId};
 use crate::chat::{self, ChatEnv, History};
 use crate::claude::{self, Failure, Proc, StartError};
+use crate::dialogue::{Answer, Heard, Keep, Log, Outcome, Took, Who};
 use crate::pace::{Measured, Pace};
 use crate::protocol::Event;
 use crate::relay::Fact;
-use crate::reply::{self, Atom, RelayAsk, Relaying};
+use crate::reply::{self, Atom, RelayAsk, Relaying, Reply};
 use crate::scratch;
 use crate::voice::{Speaker, Voice};
 use std::ffi::OsString;
@@ -81,7 +82,7 @@ const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 /// What the thread is asked to do, in the order it is asked.
 enum Job {
-    Say(String),
+    Say(Heard),
     /// From the next job on she is this character.
     Character(Character),
     /// She says this in the current voice, and the model is not asked.
@@ -121,10 +122,10 @@ pub fn start(config: Config, sink: Sink) -> Handle {
 }
 
 impl Handle {
-    /// Puts a sentence in the queue. `Err` means the engine thread is gone, which the caller should
-    /// say, because nothing else will.
-    pub fn say(&self, text: String) -> Result<(), String> {
-        self.submit(Job::Say(text))
+    /// Puts a sentence in the queue, timed from now. `Err` means the engine thread is gone, which
+    /// the caller should say, because nothing else will.
+    pub fn say(&self, text: String, keep: Option<Keep>) -> Result<(), String> {
+        self.submit(Job::Say(Heard::now(text, keep)))
     }
 
     /// Queues a change of character. A turn in flight, and any queued before this, is finished as
@@ -190,27 +191,34 @@ fn work(config: &Config, queue: &Receiver<Job>, stop: &AtomicBool, sink: &Sink) 
     let mut pace = Pace::START;
     // How the last relay ended, put in front of each sentence until a model has answered one.
     let mut note: Option<Fact> = None;
+    let mut log = Log::new();
     for job in queue {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         let sent = match job {
-            Job::Say(text) => {
+            Job::Say(heard) => {
+                // The record keeps the user's words, so the note goes on a copy.
                 let text = match (note, &backend) {
-                    (Some(fact), Backend::Claude { .. } | Backend::Openai { .. }) => format!("{}\n{text}", reply::note(fact)),
-                    _ => text,
+                    (Some(fact), Backend::Claude { .. } | Backend::Openai { .. }) => format!("{}\n{}", reply::note(fact), heard.text),
+                    _ => heard.text.clone(),
                 };
-                say(&text, &mut backend, &character, &mut pace, config, stop, sink).map(|answered| {
-                    if answered {
-                        note = None;
-                    }
-                })
+                let took = say(&text, &mut backend, &character, &mut pace, config, stop, sink);
+                if took.as_ref().is_ok_and(|took| took.outcome.answered()) {
+                    note = None;
+                }
+                log.turn(&heard, took.as_ref().ok(), who(&backend, config));
+                took.map(|_| ())
             }
             Job::Relayed(fact) => {
                 note = Some(fact);
                 Ok(())
             }
-            Job::Greet(greeting) => speak(&reply::echo(greeting.into_text()), &mut pace, &config.speaker, character.voice(), stop, sink),
+            Job::Greet(greeting) => {
+                let spoke = speak(&reply::echo(greeting.into_text()), &mut pace, &config.speaker, character.voice(), stop, sink);
+                log.greeted();
+                spoke.map(|_| ())
+            }
             Job::Character(next) => {
                 change_character(&mut character, next, &mut backend, config);
                 Ok(())
@@ -230,11 +238,11 @@ fn work(config: &Config, queue: &Receiver<Job>, stop: &AtomicBool, sink: &Sink) 
     }
 }
 
-/// One sentence, answered and sent. `Ok(false)` is a sentence the engine failed to answer: the
-/// client has been told, and the engine may not have heard it.
-fn say(text: &str, backend: &mut Backend, character: &Character, pace: &mut Pace, config: &Config, stop: &AtomicBool, sink: &Sink) -> Result<bool, Halt> {
+/// One sentence, answered and sent, and what it came to. An outcome that is not `answered()` is a
+/// sentence the client has been told was not answered, and the engine may not have heard it.
+fn say(text: &str, backend: &mut Backend, character: &Character, pace: &mut Pace, config: &Config, stop: &AtomicBool, sink: &Sink) -> Result<Took, Halt> {
     let turn = match backend {
-        Backend::Echo { .. } => Turn::Said(reply::echo(text.to_string())),
+        Backend::Echo { .. } => Turn::Said { atoms: reply::echo(text.to_string()), answer: Answer::echo(text) },
         Backend::Claude { proc } => {
             let began = Instant::now();
             let turn = claude_turn(proc, config, character, text, stop);
@@ -249,29 +257,47 @@ fn say(text: &str, backend: &mut Backend, character: &Character, pace: &mut Pace
                 "vrchatcore: openai answered in {:.0} ms ({sent} turns of history sent{})",
                 began.elapsed().as_secs_f64() * 1000.0,
                 match &turn {
-                    Turn::Failed(why) => format!(", failed: {why}"),
+                    Turn::Refused(why) | Turn::Failed(why) => format!(", failed: {why}"),
                     _ => String::new(),
                 }
             );
             turn
         }
     };
-    let answered = !matches!(turn, Turn::Failed(_));
-    match turn {
-        Turn::Said(atoms) => speak(&atoms, pace, &config.speaker, character.voice(), stop, sink),
+    let engine = Instant::now();
+    let unspoken = |sent: Result<(), Halt>| sent.map(|()| Spoke { first: None, audio: 0.0 });
+    let (outcome, answer, spoke) = match turn {
+        Turn::Said { atoms, answer } => (Outcome::Answered, Some(answer), speak(&atoms, pace, &config.speaker, character.voice(), stop, sink)),
         // Her clauses are dropped: nothing she wrote this turn is said, so nothing she wrote can
         // claim an outcome. The pet answers in fixed words.
-        Turn::Relay(ask) => send(&Event::RelayAsked { to: ask.to().to_string(), text: ask.text().to_string() }, stop, sink)
-            .and_then(|()| send(&Event::TurnEnd, stop, sink)),
-        Turn::Failed(why) => send(&error(why), stop, sink),
-        Turn::Stopped => Err(Halt::Stopped),
-    }
-    .and_then(|()| match backend {
+        Turn::Relay(ask) => (
+            Outcome::RelayAsked,
+            None,
+            unspoken(
+                send(&Event::RelayAsked { to: ask.to().to_string(), text: ask.text().to_string() }, stop, sink)
+                    .and_then(|()| send(&Event::TurnEnd, stop, sink)),
+            ),
+        ),
+        Turn::Refused(why) => (Outcome::Refused, None, unspoken(send(&error(why), stop, sink))),
+        Turn::Failed(why) => (Outcome::Failed, None, unspoken(send(&error(why), stop, sink))),
+        Turn::Stopped => return Err(Halt::Stopped),
+    };
+    let spoke = spoke?;
+    match backend {
         // After the echo and not before, so it is the last thing the client shows.
-        Backend::Echo { notice } => notice.take().map_or(Ok(()), |message| send(&Event::Error { message }, stop, sink)),
-        Backend::Claude { .. } | Backend::Openai { .. } => Ok(()),
-    })
-    .map(|()| answered)
+        Backend::Echo { notice } => notice.take().map_or(Ok(()), |message| send(&Event::Error { message }, stop, sink))?,
+        Backend::Claude { .. } | Backend::Openai { .. } => {}
+    }
+    Ok(Took { outcome, answer, engine, first_part: spoke.first, audio: spoke.audio })
+}
+
+/// The engine that is running, for the record.
+fn who<'a>(backend: &'a Backend, config: &'a Config) -> Who<'a> {
+    match backend {
+        Backend::Echo { .. } => Who { kind: "echo", model: None },
+        Backend::Claude { .. } => Who { kind: "claude", model: Some(&config.model) },
+        Backend::Openai { client, .. } => Who { kind: "openai", model: client.service().ok().map(chat::Service::model) },
+    }
 }
 
 /// Makes `next` the character. A new prompt is someone else, who does not remember what the last
@@ -321,10 +347,17 @@ fn send(event: &Event, stop: &AtomicBool, sink: &Sink) -> Result<(), Halt> {
     sink(event).map_err(Halt::Closed)
 }
 
+/// When the first part went out, and how much voiced audio went in all.
+struct Spoke {
+    first: Option<Instant>,
+    audio: f64,
+}
+
 /// Sends an answer in parts, each as soon as its voice is ready, and then `turn_end`. `pace` cuts
 /// the parts: the first from its estimates alone, every later one from how much of the audio
 /// already sent is still to play, and each voiced part teaches it.
-fn speak(atoms: &[Atom], pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, stop: &AtomicBool, sink: &Sink) -> Result<(), Halt> {
+fn speak(atoms: &[Atom], pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, stop: &AtomicBool, sink: &Sink) -> Result<Spoke, Halt> {
+    let mut spoke = Spoke { first: None, audio: 0.0 };
     let syllables: Vec<usize> = atoms.iter().map(|atom| atom.syllables).collect();
     // When the page runs out of what it has been sent. Playback is taken to start when part 0 is
     // sent; each later part plays after it, or at once if it arrives after the end.
@@ -352,6 +385,7 @@ fn speak(atoms: &[Atom], pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, st
                     rest.iter().sum::<usize>()
                 );
                 send(&reply::said(&atoms[at..]).utterance(part, Voice::Silent { why }), stop, sink)?;
+                spoke.first.get_or_insert_with(Instant::now);
                 break;
             }
         };
@@ -359,6 +393,8 @@ fn speak(atoms: &[Atom], pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, st
         pace.learn(Measured { syllables: piece, audio, synthesis });
         let sent = Instant::now();
         send(&said.utterance(part, Voice::Voiced(speech)), stop, sink)?;
+        spoke.first.get_or_insert(sent);
+        spoke.audio += audio;
         let queued = match (lead, playback_end) {
             (Some(lead), Some(end)) => format!("cut with {lead:.2} s of lead, sent with {:+.2} s", seconds_until(end, sent)),
             _ => "first".to_string(),
@@ -373,7 +409,7 @@ fn speak(atoms: &[Atom], pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, st
         at += n;
         part += 1;
     }
-    send(&Event::TurnEnd, stop, sink)
+    send(&Event::TurnEnd, stop, sink).map(|()| spoke)
 }
 
 /// Signed: below zero, the page went quiet for that long before `at`.
@@ -445,13 +481,19 @@ fn error(message: String) -> Event {
 
 /// What an engine made of one sentence.
 enum Turn {
-    Said(Vec<Atom>),
+    Said { atoms: Vec<Atom>, answer: Answer },
     /// She asked for a relay, and said nothing that will be heard.
     Relay(RelayAsk),
-    /// The reason, which the client is told as an `error`.
+    /// The engine answered and `reply::parse` turned it down. The reason is told as an `error`.
+    Refused(String),
+    /// No answer came back that could be parsed. The reason is told as an `error`.
     Failed(String),
     /// The core is shutting down, so nothing is said.
     Stopped,
+}
+
+fn said(reply: &Reply) -> Turn {
+    Turn::Said { atoms: reply.atoms(), answer: Answer::of(reply) }
 }
 
 /// One sentence through the HTTP engine. The turn joins the history only once `parse` has taken
@@ -461,9 +503,9 @@ fn openai_turn(client: &chat::Client, history: &mut History, character: &Charact
         Ok(answered) => match reply::parse(&answered, Relaying::Off) {
             Ok(reply) => {
                 history.push(text, &answered);
-                Turn::Said(reply.atoms())
+                said(&reply)
             }
-            Err(why) => Turn::Failed(why),
+            Err(why) => Turn::Refused(why),
         },
         Err(Failure::Stopped) => Turn::Stopped,
         Err(Failure::Broken(why)) => Turn::Failed(why),
@@ -490,11 +532,10 @@ fn claude_turn(slot: &mut Option<Proc>, config: &Config, character: &Character, 
         return Turn::Failed("claude is not running".to_string());
     };
     match proc.ask(text, config.turn_timeout, stop) {
-        Ok(message) => match claude::answer(&message, config.relaying) {
-            Ok(reply) => match reply.relay {
-                Some(ask) => Turn::Relay(ask),
-                None => Turn::Said(reply.atoms()),
-            },
+        Ok(message) => match claude::result(&message).map(|text| reply::parse(text, config.relaying)) {
+            Ok(Ok(Reply { relay: Some(ask), .. })) => Turn::Relay(ask),
+            Ok(Ok(reply)) => said(&reply),
+            Ok(Err(why)) => Turn::Refused(why),
             Err(why) => Turn::Failed(why),
         },
         Err(Failure::Stopped) => Turn::Stopped,

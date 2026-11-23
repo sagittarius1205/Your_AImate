@@ -2,6 +2,7 @@
 // may ever be written to stdout.
 
 use crate::character::{Character, Greeting};
+use crate::dialogue::Keep;
 use crate::relay::{self, Nonce, Order};
 use crate::voice::Voice;
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(try_from = "Wire")]
 pub enum Request {
-    Say { text: String },
+    /// `keep` is the line's `record`, there only when the client wants this turn in the dialogue
+    /// record (`dialogue.rs`). Without it nothing of the turn is kept.
+    Say { text: String, keep: Option<Keep> },
     /// Takes effect with the next turn: a turn already queued ahead of it is answered as the
     /// character it was asked of.
     Character(Character),
@@ -30,11 +33,17 @@ pub enum Request {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Wire {
-    Say { text: String },
+    Say { text: String, record: Option<WireRecord> },
     Character { name: String, persona: String, voice: Option<String> },
     Greet { text: String },
     Relay { nonce: String, title: String, body: String, summary: String },
     Shutdown,
+}
+
+#[derive(Deserialize)]
+struct WireRecord {
+    to: String,
+    via: String,
 }
 
 impl TryFrom<Wire> for Request {
@@ -42,7 +51,7 @@ impl TryFrom<Wire> for Request {
 
     fn try_from(wire: Wire) -> Result<Request, String> {
         Ok(match wire {
-            Wire::Say { text } => Request::Say { text },
+            Wire::Say { text, record } => Request::Say { text, keep: record.map(|r| Keep::new(&r.to, &r.via)).transpose()? },
             Wire::Character { name, persona, voice } => Request::Character(Character::new(&name, &persona, voice.as_deref())?),
             Wire::Greet { text } => Request::Greet(Greeting::new(&text)?),
             Wire::Relay { nonce, title, body, summary } => {

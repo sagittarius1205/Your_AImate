@@ -61,15 +61,21 @@ pub const FONT_SIZE: Bounded = Bounded { field: "look.font_size", low: 11.0, hig
 
 pub const NUMBERS: [Bounded; 6] = [VOLUME, WINDOW, FIGURE, UI, BUBBLE_OPACITY, FONT_SIZE];
 
-/// The six switches and their defaults, in the order the settings window lists them.
-pub const SWITCHES: [(&str, bool); 6] = [
+/// The switches and their defaults, in the order the settings window lists them. `record` is off
+/// until the user turns it on, because what it keeps is their conversation (lin, 2026-11-23).
+pub const SWITCHES: [(&str, bool); 7] = [
     ("voice", true),
     ("fillers", true),
     ("mic", true),
     ("follow", true),
     ("on_top", true),
     ("autostart", false),
+    ("record", false),
 ];
+
+/// The dialogue record, in the home, which the core appends to while `switches.record` is on
+/// (Docs/DESIGN_ChatCore.md §13).
+pub const RECORD_FILE: &str = "dialogue.jsonl";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Settings {
@@ -130,6 +136,7 @@ pub struct Switches {
     pub follow: bool,
     pub on_top: bool,
     pub autostart: bool,
+    pub record: bool,
 }
 
 /// Where her voice is synthesised (Docs/DESIGN_Settings.md 4). An enum and not a kind string with
@@ -198,7 +205,7 @@ impl Default for Settings {
             character: None,
             volume: VOLUME.default,
             scale: Scale { window: WINDOW.default, figure: FIGURE.default, ui: UI.default },
-            switches: Switches { voice: true, fillers: true, mic: true, follow: true, on_top: true, autostart: false },
+            switches: Switches { voice: true, fillers: true, mic: true, follow: true, on_top: true, autostart: false, record: false },
             speech: Speech::Local,
             stt: SttPack { pack: DEFAULT_PACK.to_string() },
             chat: Chat::Claude { model: ClaudeModel::Haiku },
@@ -544,6 +551,7 @@ impl Settings {
                 follow: switch(&mut r, 3),
                 on_top: switch(&mut r, 4),
                 autostart: switch(&mut r, 5),
+                record: switch(&mut r, 6),
             },
             speech: r.speech(),
             stt: SttPack { pack: r.pack() },
@@ -718,6 +726,15 @@ impl Store {
 
     pub fn current(&self) -> Settings {
         self.loaded().settings
+    }
+
+    /// Where the core is to keep the turn a sentence starts: `<home>/dialogue.jsonl` while the user
+    /// has the record on, and `None` otherwise. Asked at each sentence, so a switch takes effect with
+    /// the next one. The core's wire is JSON, so a home whose path is not Unicode keeps nothing.
+    pub fn record_file(&self) -> Option<String> {
+        let on = self.now.lock().expect("settings poisoned").settings.switches.record;
+        let home = self.home.as_ref().filter(|_| on)?;
+        home.join(RECORD_FILE).to_str().map(str::to_string)
     }
 
     /// The window's scale alone, for the poll thread, which asks 25 times a second.

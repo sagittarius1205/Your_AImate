@@ -151,6 +151,12 @@ pub fn classify(line: &[u8]) -> Line {
 
 /// The `result` message as a `Reply`: the first decode, then the checks in `reply::parse`.
 pub fn answer(message: &Value, relaying: Relaying) -> Result<Reply, String> {
+    reply::parse(result(message)?, relaying)
+}
+
+/// The first decode alone: the answer's text out of the `result` message, or why there is none.
+/// Apart from `reply::parse`, so a turn can say whether claude failed or the core refused it.
+pub fn result(message: &Value) -> Result<&str, String> {
     let subtype = message.get("subtype").and_then(Value::as_str);
     let flagged = message.get("is_error").and_then(Value::as_bool).unwrap_or(false);
     if flagged || subtype.is_some_and(|s| s != "success") {
@@ -162,7 +168,7 @@ pub fn answer(message: &Value, relaying: Relaying) -> Result<Reply, String> {
         return Err(format!("claude reported an error{which}: {}", reply::excerpt(&said)));
     }
     match message.get("result") {
-        Some(Value::String(text)) => reply::parse(text, relaying),
+        Some(Value::String(text)) => Ok(text),
         Some(other) => Err(format!("claude's result is {}, not a string", reply::kind(other))),
         None => Err("claude's result message has no `result` field".to_string()),
     }

@@ -2,6 +2,7 @@ mod character;
 mod chat;
 mod checks;
 mod claude;
+mod dialogue;
 mod engine;
 mod pace;
 mod protocol;

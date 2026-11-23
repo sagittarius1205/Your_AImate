@@ -343,9 +343,18 @@ fn core_state(core: tauri::State<'_, core::Core>) -> core::CoreState {
 /// leave the page waiting on a promise. An `Err` here means the line never reached the core.
 /// `async` so a write that blocks on a full pipe holds a worker thread and not the one that runs
 /// the window.
+///
+/// The record switch is read here, at each sentence, which is what lets turning it off hold from
+/// the very next sentence without a restart (Docs/DESIGN_Settings.md 1).
 #[tauri::command]
-async fn say(core: tauri::State<'_, core::Core>, text: String) -> Result<(), String> {
-    core.say(&text)
+async fn say(
+    core: tauri::State<'_, core::Core>,
+    store: tauri::State<'_, settings::Store>,
+    text: String,
+    via: core::Via,
+) -> Result<(), String> {
+    let record = store.record_file();
+    core.say(&text, record.as_deref().map(|to| (to, via)))
 }
 
 /// The next thinking filler, so the character makes a sound the moment the user stops typing

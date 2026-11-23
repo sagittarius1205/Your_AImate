@@ -1084,8 +1084,8 @@ const Speaker = (function () {
   return { filler, speak, queue, stop, level, timeline, configure, state: () => (ctx ? ctx.state : "none"), playing: () => playing !== null, volume: () => (gain ? gain.gain.value : volume) };
 })();
 
-Chat.onChoose((text) => {
-  invoke("say", { text }).catch((e) => trouble("這句話沒送到核心：" + String(e)));
+Chat.onChoose((text, via) => {
+  invoke("say", { text, via }).catch((e) => trouble("這句話沒送到核心：" + String(e)));
   // Separate and not chained: a filler that fails must never stop the sentence being sent, and a
   // sentence that fails to send still deserves the sound, because the user's own action happened.
   Speaker.filler().catch((e) => console.error("filler: " + String(e)));
@@ -1537,7 +1537,7 @@ function onSttEvent(p) {
     if (typeof p.text === "string" && !micSeen.has(key)) {
       micSeen.add(key);
       micExplained = false;
-      Chat.submit(p.text);
+      Chat.submit(p.text, "mic");
     }
     if (!micHeld) setMic(MicState.Idle);
   } else if (p.ev === "nothing") {

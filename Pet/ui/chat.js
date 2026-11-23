@@ -246,13 +246,15 @@ window.Chat = (function () {
     return true;
   }
 
-  function send(text) {
+  // `via` is "mic" for a spoken sentence; the field and the cards leave it out and are "text".
+  function send(text, via) {
     show({ who: Who.User, text: text, choices: [] });
+    const how = via === "mic" ? "mic" : "text";
     // A copy, so a callback that registers another does not change this round. One that throws
     // must not stop the others, and `console.error` is where the page collects what went wrong.
     chosen.slice().forEach(function (cb) {
       try {
-        cb(text);
+        cb(text, how);
       } catch (e) {
         console.error(e);
       }

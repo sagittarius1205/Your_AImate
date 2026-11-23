@@ -212,6 +212,9 @@ pub struct Reply {
     pub clauses: Vec<Clause>,
     /// `Some` only when relaying is offered and she filled it.
     pub relay: Option<RelayAsk>,
+    /// As the model wrote them, for the dialogue record. Nothing is said or checked by them.
+    pub language: Option<String>,
+    pub affect: Option<String>,
 }
 
 /// What she asked to have passed on, in the user's words. `to` may be empty, and it is never a
@@ -336,9 +339,10 @@ fn clause_atoms(clause: &Clause) -> Vec<Atom> {
 
 /// The second decode. `claude` hands over its answer as a string that holds the JSON, so this takes
 /// that string and not a value. Rejects the whole turn at the first clause that breaks a rule, and
-/// says which clause and which rule. `Off` ignores a `relay` key, as `language` and `affect` are
-/// ignored. `On` reads it: null or absent is no relay, because an engine that ignores the schema
-/// leaves it out, and anything else has to be a relay that keeps its limits or the turn is refused.
+/// says which clause and which rule. `Off` ignores a `relay` key. `On` reads it: null or absent is
+/// no relay, because an engine that ignores the schema leaves it out, and anything else has to be a
+/// relay that keeps its limits or the turn is refused. `language` and `affect` are taken when they
+/// are strings and never refuse a turn.
 pub fn parse(result: &str, relaying: Relaying) -> Result<Reply, String> {
     let value: Value = serde_json::from_str(result)
         .map_err(|e| format!("the answer is not JSON ({e}): {}", excerpt(result)))?;
@@ -363,7 +367,8 @@ pub fn parse(result: &str, relaying: Relaying) -> Result<Reply, String> {
         (Relaying::Off, _) | (Relaying::On, None | Some(Value::Null)) => None,
         (Relaying::On, Some(value)) => Some(parse_relay(value)?),
     };
-    Ok(Reply { clauses, relay })
+    let text = |name: &str| object.get(name).and_then(Value::as_str).map(str::to_string);
+    Ok(Reply { clauses, relay, language: text("language"), affect: text("affect") })
 }
 
 fn parse_relay(value: &Value) -> Result<RelayAsk, String> {

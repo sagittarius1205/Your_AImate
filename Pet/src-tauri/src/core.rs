@@ -19,10 +19,13 @@
 //! - `relay_asked`, `relay_step` and `relayed`, the relay's three events, which go to `relay.rs` and
 //!   not to the page. That file restates them.
 //!
-//! The pet writes four lines: `{"op":"say","text"}`, `{"op":"character","name","persona","voice"?}`
+//! The pet writes four lines: `{"op":"say","text","record"?}`, `{"op":"character","name","persona","voice"?}`
 //! once as each core starts and again on each change of character, `{"op":"greet","text"}`,
 //! which the core voices like a turn of one part with no tags, and `{"op":"relay","nonce","title",
 //! "body","summary"}`, one per approved relay. The core is started as `serve --relay` for the last.
+//! A `say`'s `record` is `{"to","via"}`, only while the user keeps the dialogue record: the file the
+//! core appends the turn to and whether the sentence was spoken or typed. Without it the line is the
+//! one from before the record existed, and the core keeps nothing.
 //!
 //! A voiced line is a few hundred kilobytes (about 430 KB of base64 for ten seconds of speech). It
 //! is relayed like any other line, whole, with one field added on the way (`for_page`): a voiced
@@ -48,7 +51,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager};
 use vrcue::Bindings;
@@ -117,10 +120,23 @@ impl CoreState {
     }
 }
 
+/// How a sentence reached the page: spoken into the microphone, or typed or chosen from a card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    Mic,
+    Text,
+}
+
 /// The one line that hands the core a sentence. `to_string` on a `Value` escapes every newline and
 /// quote in `text`, so the framing (one object per line) cannot be broken by what the user typed.
-pub fn say_line(text: &str) -> String {
-    framed(json!({ "op": "say", "text": text }))
+/// `record` is the file to keep the turn in, there only while the user keeps the record.
+pub fn say_line(text: &str, record: Option<(&str, Via)>) -> String {
+    let mut line = json!({ "op": "say", "text": text });
+    if let Some((to, via)) = record {
+        line["record"] = json!({ "to": to, "via": via });
+    }
+    framed(line)
 }
 
 /// The line that tells the core who she is (Docs/DESIGN_Characters.md 5). `voice` is left out, and
@@ -395,8 +411,8 @@ impl Core {
     }
 
     /// Writes one `say` to the core. An `Err` reaches the page, which says it in the bubble.
-    pub fn say(&self, text: &str) -> Result<(), String> {
-        self.write(&say_line(text))
+    pub fn say(&self, text: &str, record: Option<(&str, Via)>) -> Result<(), String> {
+        self.write(&say_line(text, record))
     }
 
     /// Tells the running core who she is now. A core that is not running is not told and nothing is

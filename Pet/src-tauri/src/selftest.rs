@@ -20,8 +20,8 @@ use vrcue::{
 };
 
 use crate::core::{
-    CoreState, EVENT as CORE_EVENT, EXE_ENV, STATE_EVENT as CORE_STATE_EVENT, bad_line_event, candidates, exit_why,
-    locate, parse_line, pump, say_line,
+    CoreState, EVENT as CORE_EVENT, EXE_ENV, STATE_EVENT as CORE_STATE_EVENT, Via, bad_line_event, candidates,
+    exit_why, locate, parse_line, pump, say_line,
 };
 use crate::cue::resolve::{Claim, ScheduledAction, schedule};
 use crate::cast;
@@ -300,6 +300,7 @@ const TESTS: &[(&str, &[Case])] = &[
             ("a_chat_service_is_checked_and_an_old_chat_model_still_reads", a_chat_service_is_checked_and_an_old_chat_model_still_reads),
             ("the_models_are_asked_of_the_core_and_not_the_page", the_models_are_asked_of_the_core_and_not_the_page),
             ("the_file_round_trips_and_keeps_what_it_does_not_know", the_file_round_trips_and_keeps_what_it_does_not_know),
+            ("the_dialogue_record_is_off_until_turned_on_and_off_at_once", the_dialogue_record_is_off_until_turned_on_and_off_at_once),
             ("an_old_files_figure_is_the_window", an_old_files_figure_is_the_window),
             ("a_request_is_whole_or_refused", a_request_is_whole_or_refused),
             ("each_window_gets_exactly_its_commands", each_window_gets_exactly_its_commands),
@@ -2210,7 +2211,7 @@ fn the_fixture_is_gone_and_the_page_asks_the_core(c: &mut Checks) {
     let handler: String =
         PAGE.find("Chat.onChoose(").map(|at| PAGE[at..].chars().take(160).collect()).unwrap_or_default();
     c.that(!handler.is_empty(), "the page handles a typed sentence or a pressed card");
-    c.that(handler.contains("invoke(\"say\", { text })"), "and hands that sentence to the core through say");
+    c.that(handler.contains("invoke(\"say\", { text, via })"), "and hands that sentence to the core through say, with how it came");
     c.that(PAGE.contains("invoke(\"core_state\")"), "the page asks once what the core is doing");
 }
 
@@ -2672,7 +2673,14 @@ fn a_bad_line_reaches_the_page_as_an_error_it_already_handles(c: &mut Checks) {
 }
 
 fn the_say_line_is_one_json_line_carrying_the_text_exactly(c: &mut Checks) {
-    c.eq(say_line("hi"), "{\"op\":\"say\",\"text\":\"hi\"}\n".to_string(), "the line the core reads, spelled out");
+    c.eq(say_line("hi", None), "{\"op\":\"say\",\"text\":\"hi\"}\n".to_string(), "the line the core reads, spelled out");
+    // ChatCore/src/protocol.rs reads `record` as {to, via}; checks.rs there parses this same line.
+    c.eq(
+        say_line("hi", Some((r"X:\pet\dialogue.jsonl", Via::Mic))),
+        "{\"op\":\"say\",\"record\":{\"to\":\"X:\\\\pet\\\\dialogue.jsonl\",\"via\":\"mic\"},\"text\":\"hi\"}\n".to_string(),
+        "a sentence whose turn is kept names the file and how it came",
+    );
+    c.that(say_line("hi", Some(("d.jsonl", Via::Text))).contains("\"via\":\"text\""), "a typed one says text");
 
     // Each of these has broken some line-oriented protocol before: a newline ends the frame early,
     // a quote ends the string, and the last one is a sentence that looks like a different request.
@@ -2689,7 +2697,7 @@ fn the_say_line_is_one_json_line_carrying_the_text_exactly(c: &mut Checks) {
         "}{ not framing",
         "{\"op\":\"shutdown\"}",
     ] {
-        let line = say_line(text);
+        let line = say_line(text, None);
         let body = line.strip_suffix('\n').unwrap_or("");
         c.that(
             !body.is_empty() && !body.contains('\n') && !body.contains('\r'),
@@ -4563,7 +4571,7 @@ fn a_transcript_takes_the_typed_path_once(c: &mut Checks) {
     let handler = page_block("function onSttEvent(");
     let seen = handler.find("!micSeen.has(key)");
     let add = handler.find("micSeen.add(key);");
-    let submit = handler.find("Chat.submit(p.text);");
+    let submit = handler.find("Chat.submit(p.text, \"mic\");");
     c.that(
         matches!((seen, add, submit), (Some(a), Some(b), Some(s)) if a < b && b < s),
         format!("a transcript is checked against the ones already sent, recorded, then submitted: {seen:?} {add:?} {submit:?}"),
@@ -5147,7 +5155,7 @@ fn the_defaults_are_the_designs(c: &mut Checks) {
     let design = json!({
         "volume": 0.8,
         "scale": { "window": 1.0, "figure": 1.0, "ui": 1.0 },
-        "switches": { "voice": true, "fillers": true, "mic": true, "follow": true, "on_top": true, "autostart": false },
+        "switches": { "voice": true, "fillers": true, "mic": true, "follow": true, "on_top": true, "autostart": false, "record": false },
         "speech": { "kind": "local" },
         "stt": { "pack": "sense-voice-zh-en-ja-ko-yue-int8-2024-07-17" },
         "chat": { "kind": "claude", "model": "haiku" },
@@ -5443,6 +5451,60 @@ fn the_file_round_trips_and_keeps_what_it_does_not_know(c: &mut Checks) {
     c.that(broken.problems.len() == 1 && broken.problems[0].why.contains("JSON"), format!("and says so: {:?}", broken.problems));
 }
 
+/// The dialogue record (lin, 2026-11-23): off on a fresh install and in a file from before it
+/// existed, still on after a restart once turned on, and off from the very next sentence once
+/// turned off, on the same pet and with the kept file left as it was. The core keeps a turn only
+/// when its `say` carries `record`, which ChatCore's selftest checks from the other side
+/// (`a_turn_is_kept_only_when_its_say_asks_and_only_where_it_says`).
+fn the_dialogue_record_is_off_until_turned_on_and_off_at_once(c: &mut Checks) {
+    let before = say_line("你好", None);
+    let line = |store: &settings::Store| say_line("你好", store.record_file().as_deref().map(|to| (to, Via::Mic)));
+
+    c.eq(Settings::default().switches.record, false, "a fresh install has the record off");
+    let fresh = temp_home("record-fresh");
+    let store = settings::Store::open(Some(fresh.0.clone()));
+    c.eq(store.record_file(), None, "with no settings.json no turn is kept");
+    c.eq(line(&store), before.clone(), "so a sentence goes out as it did before the record existed");
+
+    let home = temp_home("record");
+    let _ = std::fs::write(home.0.join(settings::FILE), r#"{"switches":{"voice":false,"autostart":false}}"#);
+    let store = settings::Store::open(Some(home.0.clone()));
+    let old = store.loaded();
+    c.eq(old.problems.clone(), Vec::new(), "a file from before the record reads with nothing wrong");
+    c.eq((old.settings.switches.voice, old.settings.switches.record), (false, false), "keeps what it says and has the record off");
+    c.eq(line(&store), before.clone(), "and its sentences carry no record");
+
+    let mut request = store.current().to_value();
+    request["switches"]["record"] = json!(true);
+    let set = store.set(&request);
+    c.that(set.is_ok(), format!("turning it on is saved: {set:?}"));
+    let kept = home.0.join(settings::RECORD_FILE);
+    let want = kept.to_str().map(str::to_string);
+    c.eq(store.record_file(), want.clone(), "the next sentence is kept in <home>/dialogue.jsonl");
+    c.eq(line(&store), say_line("你好", want.as_deref().map(|to| (to, Via::Mic))), "and its say names that file");
+    c.eq(settings::Store::open(Some(home.0.clone())).record_file(), want.clone(), "the switch is still on after a restart");
+    c.that(!kept.exists(), "turning it on writes no record: the core makes the file at the first kept turn");
+
+    // VRPET_HOME, when set, is the home (home.rs), and the pet's store is opened on that home.
+    let resolved = crate::home::resolve(Some(home.0.clone().into_os_string()), Some(OsString::from(r"X:\profile")));
+    c.eq(resolved.ok().map(|h| h.join(settings::RECORD_FILE)), Some(kept.clone()), "so the file is in the home VRPET_HOME names, not the profile");
+    c.that(MAIN.contains("settings::Store::open(home::dir().ok())"), "the pet opens its settings on that home");
+    let say = source_block(MAIN, "async fn say(");
+    c.that(
+        say.contains("let record = store.record_file();") && say.contains("core.say(&text, record.as_deref().map(|to| (to, via)))"),
+        "and asks the switch at each sentence, so a change needs no restart",
+    );
+
+    let _ = std::fs::write(&kept, "{\"v\":1}\n");
+    request["switches"]["record"] = json!(false);
+    let set = store.set(&request);
+    c.that(set.is_ok(), format!("turning it off is saved: {set:?}"));
+    c.eq(store.record_file(), None, "the very next sentence, on the same pet, is not kept");
+    c.eq(line(&store), before, "and goes out as it did before");
+    c.eq(std::fs::read_to_string(&kept).ok().as_deref(), Some("{\"v\":1}\n"), "and what was kept is left as it was");
+    c.eq(settings::Store::open(Some(home.0.clone())).record_file(), None, "and it is still off after a restart");
+}
+
 /// Before 2026-11-08 `scale.figure` sized the whole window. A file from then has that key and no
 /// `scale.window`, and the user left the pet at that size, so it is read as the window, with her
 /// own size at its default, and the settings window is told. Saving once writes the new keys.
@@ -5663,6 +5725,15 @@ fn the_settings_page_and_rust_agree_on_every_field(c: &mut Checks) {
     c.that(
         SETTINGS_PAGE.contains("data-field=\"switches.autostart\" />") && !SETTINGS_PAGE.contains("之後才會做好"),
         "autostart is a switch that works, and no placeholder is left",
+    );
+    let switch = SETTINGS_PAGE.find("data-field=\"switches.record\" />記錄對話</label>");
+    let note = SETTINGS_PAGE.find(&format!(
+        "<p class=\"note\">打開後，你說的話和角色的回答會存在這台電腦 .vrpet 資料夾裡的 {}，不會上傳。</p>",
+        settings::RECORD_FILE
+    ));
+    c.that(
+        matches!((switch, note), (Some(s), Some(n)) if s < n && !SETTINGS_PAGE[s..n].contains("<label")),
+        format!("the record switch has the sentence that says what is kept and where, right after it: {switch:?} {note:?}"),
     );
     c.that(field_attr("stt.pack", "id").as_deref() == Some("sttPack"), "the speech recognition pack has a control");
     for needle in [

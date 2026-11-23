@@ -521,6 +521,10 @@ const SCENARIOS: &[Scenario] = &[
     ("claude_children_do_not_inherit_the_hosts_entrypoint", claude_children_do_not_inherit_the_hosts_entrypoint),
     ("the_outcome_goes_out_before_the_courier_and_its_folder_are_gone", the_outcome_goes_out_before_the_courier_and_its_folder_are_gone),
     ("a_courier_that_times_out_cannot_send_after_the_outcome", a_courier_that_times_out_cannot_send_after_the_outcome),
+    ("a_turn_is_kept_only_when_its_say_asks_and_only_where_it_says", a_turn_is_kept_only_when_its_say_asks_and_only_where_it_says),
+    ("a_record_that_cannot_be_written_costs_the_turn_nothing", a_record_that_cannot_be_written_costs_the_turn_nothing),
+    ("a_relay_turn_is_kept_without_what_she_asked_to_pass_on", a_relay_turn_is_kept_without_what_she_asked_to_pass_on),
+    ("a_turn_the_core_is_stopped_in_is_kept_as_interrupted", a_turn_the_core_is_stopped_in_is_kept_as_interrupted),
 ];
 
 fn transport_with_the_echo_engine() -> Result<String, String> {
@@ -2625,6 +2629,273 @@ fn a_courier_that_times_out_cannot_send_after_the_outcome() -> Result<String, St
         client.shutdown()?;
         Ok(String::new())
     })
+}
+
+// The dialogue record (Docs/DESIGN_ChatCore.md §13). The core is told where on each `say`, so these
+// stand in for the pet by naming the file the pet would name, in a home of their own.
+
+/// A folder under the temp folder, empty at the start and removed when dropped.
+struct Gone(PathBuf);
+
+impl Gone {
+    fn fresh(name: &str) -> Result<Gone, String> {
+        let dir = std::env::temp_dir().join(format!("vrchatcore-selftest-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
+        Ok(Gone(dir))
+    }
+}
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl Client {
+    fn say_kept(&mut self, text: &str, to: &Path, via: &str) -> Result<(), String> {
+        self.send(json!({ "op": "say", "text": text, "record": { "to": to, "via": via } }).to_string().as_bytes())
+    }
+}
+
+fn kept_lines(file: &Path) -> Result<Vec<Value>, String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("reading {}: {e}", file.display()))?;
+    text.lines()
+        .enumerate()
+        .map(|(n, line)| serde_json::from_str(line).map_err(|e| format!("line {} of {} is not JSON ({e}): {line}", n + 1, file.display())))
+        .collect()
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir).map(|it| it.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
+}
+
+const KEPT_KEYS: [&str; 10] = ["v", "at", "run", "turn", "user", "reply", "outcome", "engine", "ms", "gap_ms"];
+
+/// The line against `want` in every field but the four that vary from run to run, and with no field
+/// missing or added.
+fn kept_as(line: &Value, want: Value, what: &str) -> Result<(), String> {
+    let keys: Vec<&str> = line.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+    if keys.len() != KEPT_KEYS.len() || !KEPT_KEYS.iter().all(|k| keys.contains(k)) {
+        return Err(format!("{what}: the line should have exactly {KEPT_KEYS:?}, it has {keys:?}: {line}"));
+    }
+    let mut fixed = line.clone();
+    if let Some(object) = fixed.as_object_mut() {
+        for key in ["at", "run", "ms", "gap_ms"] {
+            object.remove(key);
+        }
+    }
+    if fixed == want { Ok(()) } else { Err(format!("{what}: expected {want} besides at, run, ms and gap_ms, the line is {line}")) }
+}
+
+fn ms_keys(line: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = line["ms"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Off, a turn and a failed one write nothing anywhere. On, each kept turn is one line with the
+/// user's words and her clauses as said, a refused or failed turn has its outcome and no reply, and
+/// a `say` without `record` after them adds nothing. The only file anywhere is the one named, in the
+/// home, not the profile or the cwd.
+fn a_turn_is_kept_only_when_its_say_asks_and_only_where_it_says() -> Result<String, String> {
+    let root = Gone::fresh("record")?;
+    let (home, profile) = (root.0.join("home"), root.0.join("profile"));
+    for dir in [&home, &profile] {
+        std::fs::create_dir_all(dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
+    }
+    let file = home.join("dialogue.jsonl");
+    let cwd = std::env::current_dir().map(|d| d.join("dialogue.jsonl")).unwrap_or_default();
+    let cwd_had = cwd.exists();
+    let env = [("VRPET_HOME", home.to_str().unwrap_or_default()), ("USERPROFILE", profile.to_str().unwrap_or_default())];
+    let audio_ms = FakeSpeech::voice()["samples"].as_f64().map(|s| (s * 1000.0 / f64::from(voice::SAMPLE_RATE)).round()).unwrap_or(-1.0);
+    let started = epoch_now();
+    with_core_configured(Mode::Stub { log: root.0.join("stub.log"), model: None }, &FakeSpeech::get()?.url, &env, |client| {
+        client.expect_ready()?;
+        client.say("ok")?;
+        client.expect_turn("a turn whose say does not ask", OK_TURN, json!(["nod", "offer"]))?;
+        client.say("error")?;
+        client.expect_error("a failed turn whose say does not ask", &["the stub failed on purpose"])?;
+        // The next job, so once it has ended the two turns before it are done, writes and all.
+        client.greet("嗨")?;
+        client.expect_turn("a greeting", "嗨", json!([]))?;
+        let written: Vec<String> = [&home, &profile].into_iter().flat_map(|d| names_in(d)).collect();
+        if !written.is_empty() {
+            return Err(format!("turns whose say did not ask for a record wrote {written:?}"));
+        }
+        client.say_kept("ok", &file, "mic")?;
+        client.expect_turn("a kept turn is answered as ever", OK_TURN, json!(["nod", "offer"]))?;
+        client.say_kept("bracket", &file, "text")?;
+        client.expect_error("a kept turn the core refuses", &["contains"])?;
+        client.say_kept("error", &file, "text")?;
+        client.expect_error("a kept turn that failed", &["the stub failed on purpose"])?;
+        client.say("ok")?;
+        client.expect_turn("a turn whose say no longer asks", OK_TURN, json!(["nod", "offer"]))?;
+        client.shutdown().map(drop)
+    })?;
+    let finished = epoch_now();
+
+    let lines = kept_lines(&file)?;
+    if lines.len() != 3 {
+        return Err(format!("three turns asked to be kept, the file has {} lines: {lines:?}", lines.len()));
+    }
+    let engine = json!({ "kind": "claude", "model": "haiku" });
+    let ok_reply = json!({ "clauses": ["收到", "我在這裡"], "language": "zh-TW", "affect": "calm" });
+    let user = |text: &str, via: &str| json!({ "text": text, "via": via });
+    let turn = |n: u64, said: Value, reply: Value, outcome: &str| json!({ "v": 1, "turn": n, "user": said, "reply": reply, "outcome": outcome, "engine": engine });
+    kept_as(&lines[0], turn(3, user("ok", "mic"), ok_reply, "answered"), "the kept turn, the third of this core")?;
+    kept_as(&lines[1], turn(4, user("bracket", "text"), Value::Null, "refused"), "the refused turn")?;
+    kept_as(&lines[2], turn(5, user("error", "text"), Value::Null, "failed"), "the failed turn")?;
+
+    let run = lines[0]["run"].as_str().unwrap_or_default();
+    if run.is_empty() || lines.iter().any(|l| l["run"] != run) {
+        return Err(format!("every line of one core should carry one run, saw {:?}", lines.iter().map(|l| l["run"].clone()).collect::<Vec<_>>()));
+    }
+    if let Some(line) = lines.iter().find(|l| l["at"].as_u64().is_none_or(|at| at < started || at > finished)) {
+        return Err(format!("at should be the epoch milliseconds the sentence arrived, between {started} and {finished}: {line}"));
+    }
+    let shapes: Vec<Vec<String>> = lines.iter().map(ms_keys).collect();
+    let want: Vec<Vec<String>> = [&["audio", "done", "engine", "first_audio"][..], &["done", "engine"], &["done", "engine"]]
+        .iter()
+        .map(|keys| keys.iter().map(|k| k.to_string()).collect())
+        .collect();
+    if shapes != want {
+        return Err(format!("ms should hold what each turn got to, {want:?}, it holds {shapes:?}"));
+    }
+    let ms = |key: &str| lines[0]["ms"][key].as_f64().unwrap_or(-1.0);
+    if !(0.0 <= ms("engine") && ms("engine") <= ms("first_audio") && ms("first_audio") <= ms("done")) || ms("audio") != audio_ms {
+        return Err(format!("the answered turn's ms should run engine <= first_audio <= done with {audio_ms} ms of audio: {}", lines[0]["ms"]));
+    }
+    if !lines[0]["gap_ms"].as_i64().is_some_and(|gap| gap >= 0) {
+        return Err(format!("gap_ms should count from the greeting that ended before it: {}", lines[0]));
+    }
+
+    let (in_home, in_profile) = (names_in(&home), names_in(&profile));
+    if in_home != ["dialogue.jsonl"] || !in_profile.is_empty() || (!cwd_had && cwd.exists()) {
+        return Err(format!("the named file should be the only one written: the home has {in_home:?}, the profile {in_profile:?}, the cwd's dialogue.jsonl exists: {}", cwd.exists()));
+    }
+    Ok(format!("kept_line={}", std::fs::read_to_string(&file).unwrap_or_default().lines().next().unwrap_or_default()))
+}
+
+/// A folder that has gone, and on Windows a file another process holds, cost the turn nothing: she
+/// answers each one, and stderr, which the pet keeps as its log, says so once for each outage and
+/// not once a turn. A write that works again in between ends the first outage.
+fn a_record_that_cannot_be_written_costs_the_turn_nothing() -> Result<String, String> {
+    let root = Gone::fresh("record-fail")?;
+    let missing = root.0.join("gone").join("dialogue.jsonl");
+    let locked = root.0.join("locked.jsonl");
+    let mut answered = Vec::new();
+    let stderr = with_core(Mode::Echo { warmup_ms: None }, |client| {
+        client.expect_ready()?;
+        for n in 1..=2 {
+            let text = format!("folder gone {n}");
+            let sent = Instant::now();
+            client.say_kept(&text, &missing, "text")?;
+            client.expect_turn(&format!("turn {n} into a folder that is not there"), &text, json!([]))?;
+            answered.push(ms(sent.elapsed()));
+        }
+        let folder = missing.parent().unwrap_or(&root.0);
+        std::fs::create_dir_all(folder).map_err(|e| format!("making {}: {e}", folder.display()))?;
+        client.say_kept("folder back", &missing, "text")?;
+        client.expect_turn("the turn once the folder is back", "folder back", json!([]))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let held = std::fs::OpenOptions::new().write(true).create(true).share_mode(0).open(&locked).map_err(|e| format!("holding {}: {e}", locked.display()))?;
+            for n in 1..=2 {
+                let text = format!("file held {n}");
+                let sent = Instant::now();
+                client.say_kept(&text, &locked, "text")?;
+                client.expect_turn(&format!("turn {n} into a file another process holds"), &text, json!([]))?;
+                answered.push(ms(sent.elapsed()));
+            }
+            client.greet("嗨")?;
+            client.expect_turn("a greeting, so the last write was tried before the file is let go", "嗨", json!([]))?;
+            drop(held);
+        }
+        Ok(client.stop())
+    })?;
+    let notes = stderr.lines().filter(|l| l.contains("the dialogue record could not be written")).count();
+    let outages = if cfg!(windows) { 2 } else { 1 };
+    if notes != outages {
+        return Err(format!("{outages} outages should be noted {outages} times on stderr, it was {notes}: {stderr}"));
+    }
+    let lines = kept_lines(&missing)?;
+    if lines.len() != 1 || lines[0]["user"]["text"] != "folder back" {
+        return Err(format!("only the turn after the folder came back should be in it: {lines:?}"));
+    }
+    if std::fs::metadata(&locked).map(|m| m.len()).unwrap_or(0) != 0 {
+        return Err("the held file was written to".to_string());
+    }
+    Ok(format!("unwritable_record_turns={:.1}ms_max", answered.iter().copied().fold(0.0, f64::max)))
+}
+
+/// What she asked to pass on and where is the relay's, never the record's: her relay turn is kept
+/// with its outcome and no reply. The note that tells her how the relay ended rides in front of the
+/// next sentence, and the record keeps the sentence as the user said it.
+fn a_relay_turn_is_kept_without_what_she_asked_to_pass_on() -> Result<String, String> {
+    let root = Gone::fresh("record-relay")?;
+    let file = root.0.join("dialogue.jsonl");
+    with_courier("record", "faithful", None, &[], |client, relay| {
+        client.say_kept("relayask", &file, "mic")?;
+        client.expect("her relay ask", json!({ "ev": "relay_asked", "to": "AImate 那個 session", "text": "設定頁的主題做好了，可以看了。" }))?;
+        client.expect("and the end of a turn that said nothing", json!({ "ev": "turn_end" }))?;
+        client.relay("r-1", TARGET, BODY)?;
+        client.until_relayed("r-1")?;
+        client.say_kept("ok", &file, "text")?;
+        client.expect_turn("the sentence after the relay", OK_TURN, json!(["nod", "offer"]))?;
+        if relay.heard("character").last().is_none_or(|told| !told.starts_with(reply::note(relay::Fact::Delivered))) {
+            return Err(format!("the character should have been told how the relay ended, she was told {:?}", relay.heard("character")));
+        }
+        client.shutdown().map(drop)
+    })?;
+    let lines = kept_lines(&file)?;
+    if lines.len() != 2 {
+        return Err(format!("two kept turns, the file has {} lines: {lines:?}", lines.len()));
+    }
+    let engine = json!({ "kind": "claude", "model": "haiku" });
+    kept_as(&lines[0], json!({ "v": 1, "turn": 1, "user": { "text": "relayask", "via": "mic" }, "reply": null, "outcome": "relay_asked", "engine": engine }), "her relay turn")?;
+    let reply = json!({ "clauses": ["收到", "我在這裡"], "language": "zh-TW", "affect": "calm" });
+    kept_as(&lines[1], json!({ "v": 1, "turn": 2, "user": { "text": "ok", "via": "text" }, "reply": reply, "outcome": "answered", "engine": engine }), "the sentence after it, without the note")?;
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    for needle in ["設定頁的主題做好了", "AImate 那個 session", "已經幫你傳了", TARGET, "桌寵告訴你的"] {
+        if text.contains(needle) {
+            return Err(format!("the record holds {needle:?}, which is the relay's: {text}"));
+        }
+    }
+    Ok(String::new())
+}
+
+/// A turn the core is asked to leave in, once the stand-in has the sentence, is kept as
+/// `interrupted` with no reply and only the time it took to end. The stand-in never answers `hang`.
+fn a_turn_the_core_is_stopped_in_is_kept_as_interrupted() -> Result<String, String> {
+    let root = Gone::fresh("record-stop")?;
+    let file = root.0.join("dialogue.jsonl");
+    with_courier("record-stop", "faithful", None, &[], |client, relay| {
+        client.say_kept("hang", &file, "text")?;
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        while !relay.heard("character").iter().any(|told| told == "hang") {
+            if Instant::now() >= deadline {
+                return Err(format!("the stand-in never got the sentence, it was told {:?}", relay.heard("character")));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        client.shutdown().map(drop)
+    })?;
+    let lines = kept_lines(&file)?;
+    if lines.len() != 1 {
+        return Err(format!("one kept turn, the file has {} lines: {lines:?}", lines.len()));
+    }
+    let engine = json!({ "kind": "claude", "model": "haiku" });
+    kept_as(&lines[0], json!({ "v": 1, "turn": 1, "user": { "text": "hang", "via": "text" }, "reply": null, "outcome": "interrupted", "engine": engine }), "the turn the core was stopped in")?;
+    if ms_keys(&lines[0]) != ["done"] || lines[0]["gap_ms"] != Value::Null {
+        return Err(format!("a stopped turn has only done in ms, and the first turn of a core has no gap: {}", lines[0]));
+    }
+    Ok(String::new())
 }
 
 pub fn run() -> ExitCode {
