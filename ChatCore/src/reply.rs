@@ -205,6 +205,13 @@ pub struct Clause {
     pub gesture: Gesture,
 }
 
+impl Clause {
+    /// This clause cut into atoms: the cut `Reply::atoms` makes of it inside a whole answer.
+    pub fn atoms(&self) -> Vec<Atom> {
+        clause_atoms(self)
+    }
+}
+
 /// An answer that passed every check. Holding one is the proof: the only way to get a `Reply` is
 /// `parse`.
 #[derive(Debug, PartialEq)]
@@ -423,6 +430,137 @@ fn parse_clause(at: usize, value: &Value) -> Result<Clause, String> {
         return Err(format!("clauses[{at}].text is empty, so the clause says nothing"));
     }
     Ok(Clause { text: text.trim().to_string(), gesture })
+}
+
+/// The first clause of an answer that is still being written, read from the pieces of JSON the
+/// model streams (`claude.rs`). It is handed over the moment its object closes, and only once
+/// `parse_clause` has taken it as clause 0, so nothing `parse` would refuse in that clause gets out
+/// of here. It proves nothing about the rest of the answer: the later clauses, their count and the
+/// relay are `parse`'s to judge once the answer is whole.
+///
+/// A piece can end anywhere, inside a key, an escape or a character, so the text is kept and the
+/// scan goes on from where it stopped. Only the answer's own top-level `clauses` counts, not one
+/// nested in another value or written inside a string. JSON that breaks off is never repaired: a
+/// clause that has not closed is not there.
+pub struct FirstClause {
+    text: String,
+    scanned: usize,
+    /// Containers open around the byte being scanned. The answer's object is 1.
+    depth: usize,
+    /// Where the string being scanned opened, while the scan is inside one.
+    string: Option<usize>,
+    escaped: bool,
+    seek: Seek,
+}
+
+/// What the scan is looking for, outside strings.
+#[derive(Clone, Copy)]
+enum Seek {
+    /// The answer's opening brace.
+    Answer,
+    /// A top-level key, or the comma before one.
+    Key,
+    /// The colon after a top-level key, and whether that key is `clauses`.
+    Colon { clauses: bool },
+    /// The end of a top-level value that is not `clauses`.
+    Skip,
+    /// The `[` of `clauses`.
+    Array,
+    /// The first element of `clauses`.
+    Element,
+    /// The end of the first element, which opened at this offset.
+    Clause(usize),
+}
+
+/// What one more piece made of the first clause.
+pub enum Streamed {
+    /// Not closed yet. The next piece goes into this.
+    Open(FirstClause),
+    /// Closed, and taken as clause 0.
+    Closed(Clause),
+    /// It will not come out of this stream, and why. The whole answer is still `parse`'s to judge.
+    Never(String),
+}
+
+impl FirstClause {
+    pub fn new() -> FirstClause {
+        FirstClause { text: String::new(), scanned: 0, depth: 0, string: None, escaped: false, seek: Seek::Answer }
+    }
+
+    pub fn push(mut self, piece: &str) -> Streamed {
+        self.text.push_str(piece);
+        while self.scanned < self.text.len() {
+            let at = self.scanned;
+            self.scanned += 1;
+            match self.step(at) {
+                Ok(None) => {}
+                Ok(Some(clause)) => return Streamed::Closed(clause),
+                Err(why) => return Streamed::Never(why),
+            }
+        }
+        Streamed::Open(self)
+    }
+
+    /// One byte. Every byte that means something to the structure is ASCII, and no byte of a
+    /// multi-byte character is, so a byte scan never mistakes part of a character for structure and
+    /// every offset kept is a character boundary.
+    fn step(&mut self, at: usize) -> Result<Option<Clause>, String> {
+        let byte = self.text.as_bytes()[at];
+        if let Some(open) = self.string {
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'\\' {
+                self.escaped = true;
+            } else if byte == b'"' {
+                self.string = None;
+                if let Seek::Key = self.seek {
+                    // Decoded, so an escaped key is the key it spells, as it is to `parse`.
+                    let name: String = serde_json::from_str(&self.text[open..=at]).map_err(|e| format!("a key of the answer is not JSON ({e})"))?;
+                    self.seek = Seek::Colon { clauses: name == "clauses" };
+                }
+            }
+            return Ok(None);
+        }
+        if matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+            return Ok(None);
+        }
+        match (self.seek, byte) {
+            (Seek::Answer, b'{') => {
+                self.depth = 1;
+                self.seek = Seek::Key;
+            }
+            (Seek::Answer, _) => return Err("the answer is not an object".to_string()),
+            (Seek::Key | Seek::Skip | Seek::Clause(_), b'"') => self.string = Some(at),
+            (Seek::Key, b',') => {}
+            (Seek::Key, b'}') => return Err("the answer has no `clauses`".to_string()),
+            (Seek::Colon { clauses }, b':') => self.seek = if clauses { Seek::Array } else { Seek::Skip },
+            (Seek::Array, b'[') => {
+                self.depth = 2;
+                self.seek = Seek::Element;
+            }
+            (Seek::Array, _) => return Err("`clauses` is not an array".to_string()),
+            (Seek::Element, b'{') => {
+                self.depth = 3;
+                self.seek = Seek::Clause(at);
+            }
+            (Seek::Element, b']') => return Err("the `clauses` array is empty".to_string()),
+            (Seek::Element, _) => return Err("clauses[0] is not an object".to_string()),
+            (Seek::Skip | Seek::Clause(_), b'{' | b'[') => self.depth += 1,
+            (Seek::Skip, b',') if self.depth == 1 => self.seek = Seek::Key,
+            (Seek::Skip, b'}') if self.depth == 1 => return Err("the answer has no `clauses`".to_string()),
+            (Seek::Skip | Seek::Clause(_), b'}' | b']') if self.depth > 1 => {
+                self.depth -= 1;
+                if let (Seek::Clause(open), 2) = (self.seek, self.depth) {
+                    let value: Value = serde_json::from_str(&self.text[open..=at]).map_err(|e| format!("clauses[0] is not JSON ({e})"))?;
+                    return parse_clause(0, &value).map(Some);
+                }
+            }
+            (Seek::Skip | Seek::Clause(_), b'}' | b']') => return Err("the answer's JSON is broken".to_string()),
+            (Seek::Skip | Seek::Clause(_), _) => {}
+            (Seek::Key | Seek::Colon { .. }, _) => return Err(format!("the answer's JSON is broken at {:?}", char::from(byte))),
+        }
+        Ok(None)
+    }
 }
 
 pub fn kind(value: &Value) -> &'static str {

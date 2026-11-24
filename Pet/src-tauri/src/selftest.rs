@@ -301,6 +301,7 @@ const TESTS: &[(&str, &[Case])] = &[
             ("the_models_are_asked_of_the_core_and_not_the_page", the_models_are_asked_of_the_core_and_not_the_page),
             ("the_file_round_trips_and_keeps_what_it_does_not_know", the_file_round_trips_and_keeps_what_it_does_not_know),
             ("the_dialogue_record_is_off_until_turned_on_and_off_at_once", the_dialogue_record_is_off_until_turned_on_and_off_at_once),
+            ("an_old_opening_key_is_ignored_and_kept", an_old_opening_key_is_ignored_and_kept),
             ("an_old_files_figure_is_the_window", an_old_files_figure_is_the_window),
             ("a_request_is_whole_or_refused", a_request_is_whole_or_refused),
             ("each_window_gets_exactly_its_commands", each_window_gets_exactly_its_commands),
@@ -5511,6 +5512,33 @@ fn the_dialogue_record_is_off_until_turned_on_and_off_at_once(c: &mut Checks) {
     c.eq(settings::Store::open(Some(home.0.clone())).record_file(), None, "and it is still off after a restart");
 }
 
+/// The opening is not a setting (Docs/DESIGN_ChatCore.md §15.11): the core voices the head of her
+/// first clause on every sentence. A file from the days it was one, with `opening` in any of its
+/// values and the switch before it, `switches.early_opening`, reads as any key this version does not
+/// know: with nothing wrong, with no effect, and kept in the file by every write.
+fn an_old_opening_key_is_ignored_and_kept(c: &mut Checks) {
+    let home = temp_home("opening");
+    let file = home.0.join(settings::FILE);
+    let _ = std::fs::write(&file, r#"{"opening":"clause","switches":{"voice":false,"early_opening":true}}"#);
+    let store = settings::Store::open(Some(home.0.clone()));
+    let loaded = store.loaded();
+    c.eq(loaded.problems, Vec::new(), "a file that still holds the opening and the switch before it reads with nothing wrong");
+    c.eq(loaded.settings.switches.voice, false, "and keeps what else it says");
+    for opening in [json!("whole"), json!("head"), json!("early"), json!(true)] {
+        let (read, problems) = file_parse(&one_field("opening", opening.clone()));
+        c.eq((read, problems), (Settings::default(), Vec::new()), format!("an opening of {opening} changes nothing and is nothing wrong"));
+    }
+
+    let mut request = store.current().to_value();
+    request["opening"] = json!("head");
+    let set = store.set(&request);
+    c.that(set.is_ok(), format!("a request that still carries the opening is saved: {set:?}"));
+    let saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap_or_default()).unwrap_or_default();
+    c.eq(saved["opening"].clone(), json!("clause"), "the opening in the file stays as it was, not read and not written");
+    c.eq(saved["switches"]["early_opening"].clone(), json!(true), "and so does the switch before it");
+    c.eq(Settings::default().to_value().get("opening"), None, "a fresh install writes no opening");
+}
+
 /// Before 2026-11-08 `scale.figure` sized the whole window. A file from then has that key and no
 /// `scale.window`, and the user left the pet at that size, so it is read as the window, with her
 /// own size at its default, and the settings window is told. Saving once writes the new keys.
@@ -5741,6 +5769,7 @@ fn the_settings_page_and_rust_agree_on_every_field(c: &mut Checks) {
         matches!((switch, note), (Some(s), Some(n)) if s < n && !SETTINGS_PAGE[s..n].contains("<label")),
         format!("the record switch has the sentence that says what is kept and where, right after it: {switch:?} {note:?}"),
     );
+    c.that(!SETTINGS_PAGE.contains("opening"), "the page offers no choice of opening, which Rust no longer reads (Docs/DESIGN_ChatCore.md 15.11)");
     c.that(field_attr("stt.pack", "id").as_deref() == Some("sttPack"), "the speech recognition pack has a control");
     for needle in [
         "name=\"speech\" value=\"local\"",

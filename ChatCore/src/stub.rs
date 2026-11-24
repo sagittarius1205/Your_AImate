@@ -14,6 +14,7 @@ use crate::relay;
 use crate::voice;
 use serde_json::{Value, json};
 use std::io::{BufRead, Read, Write};
+use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 /// A file the stub appends one line to when it starts: its arguments, its working directory and how
@@ -40,6 +41,22 @@ pub const COURIER_ENV: &str = "VRCHATCORE_STUB_COURIER";
 /// A file the courier appends a line to for every tool it really runs after the gate, ListAgents
 /// aside. What "sent" means in the self-test.
 pub const SENT_ENV: &str = "VRCHATCORE_STUB_SENT";
+
+/// A file a held answer waits for. `stream:<word>` streams the answer to `<word>` the way the real
+/// CLI does under `--include-partial-messages`; `gate:<word>` does the same and, when this names a
+/// file, holds the answer right after the piece that closes its first clause: it makes `held_at` of
+/// the file, then waits until the file itself exists, then writes the rest and the `result`. After
+/// 10 s it goes on anyway, so a test that never lets it go fails on its own step timeout.
+pub const GATE_ENV: &str = "VRCHATCORE_STUB_GATE";
+
+/// The file a held answer makes when it starts to wait.
+pub fn held_at(gate: &Path) -> std::path::PathBuf {
+    gate.with_extension("held")
+}
+
+/// Characters per streamed piece. Small and odd, so pieces end inside keys, inside gesture names
+/// and inside the text, as the real ones do.
+const PIECE_CHARS: usize = 5;
 
 fn append(env: &str, line: &Value) {
     if let Some(path) = std::env::var_os(env) {
@@ -77,6 +94,8 @@ pub fn run() -> ExitCode {
     if args.iter().any(|a| a == relay::TOOLS) {
         return courier(&args);
     }
+    let schema: Value = args.iter().position(|a| a == "--json-schema").and_then(|i| args.get(i + 1)).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+    let required: Vec<String> = schema["required"].as_array().map(|keys| keys.iter().filter_map(|k| k.as_str().map(str::to_string)).collect()).unwrap_or_default();
 
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -90,16 +109,15 @@ pub fn run() -> ExitCode {
             .iter()
             .find_map(|fact| text.strip_prefix(crate::reply::note(*fact))?.strip_prefix('\n'))
             .unwrap_or(&text);
-        match said {
-            "die" => {
-                // A lot of stderr first, so the last line is still being read when the exit is
-                // seen: the last line is the one that explains the death.
-                for n in 0..300 {
-                    eprintln!("noise {n} {}", "x".repeat(1000));
-                }
-                eprintln!("boom: the stub died on purpose");
-                return ExitCode::from(3);
+        let held = said.strip_prefix("gate:").map(|word| (word, std::env::var_os(GATE_ENV).map(std::path::PathBuf::from)));
+        if let Some((word, gate)) = said.strip_prefix("stream:").map(|word| (word, None)).or(held) {
+            if let Some(code) = streamed(word, &required, gate.as_deref()) {
+                return code;
             }
+            continue;
+        }
+        match said {
+            "die" => return die(),
             "garbage" => println!("this is not json"),
             // Never answers, and does not leave when its input closes. Only being killed ends it.
             "hang" => loop {
@@ -118,13 +136,7 @@ pub fn run() -> ExitCode {
                 send(&success(&clauses(&[("再見", "nod")])));
                 return ExitCode::SUCCESS;
             }
-            "bracket" => send(&success(&clauses(&[("好的", "none"), ("[happy] hi", "none")]))),
-            // Claims the delivery in her clauses and asks for the relay, the turn that must say nothing.
-            "relayask" => {
-                let mut answer: Value = serde_json::from_str(&clauses(&[("已經幫你傳了", "nod")])).unwrap_or_default();
-                answer["relay"] = json!({ "to": "AImate 那個 session", "text": "設定頁的主題做好了，可以看了。" });
-                send(&success(&answer.to_string()));
-            }
+            "bracket" | "relayask" | "four" | "long" => send(&success(&answer_to(said).to_string())),
             "badrelay" => {
                 let mut answer: Value = serde_json::from_str(&clauses(&[("好", "nod")])).unwrap_or_default();
                 answer["relay"] = json!({ "to": "AImate", "text": "  " });
@@ -138,25 +150,52 @@ pub fn run() -> ExitCode {
                 "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "the stub failed on purpose",
             })),
             "many" => send(&success(&clauses(&[("一", "nod"), ("二", "none"), ("三，四", "nod")]))),
-            "four" => send(&success(&clauses(&[("一", "nod"), ("二", "none"), ("三", "nod"), ("四", "lookAway")]))),
-            // Long enough that the starting pace cuts it into parts.
-            "long" => send(&success(&clauses(&[
-                ("好熱喔，我懂那種不想動的感覺。", "selfRef"),
-                ("要不要先待在家吹冷氣，喝點冰的，", "offer"),
-                ("等傍晚涼一點再出去走走？", "nod"),
-            ]))),
             other => match other.strip_prefix("echo:") {
                 Some(said) => send(&success(&clauses(&[(said, "none")]))),
-                None => send(&success(&clauses(&[("收到", "nod"), ("我在這裡", "offer")]))),
+                None => send(&success(&answer_to("ok").to_string())),
             },
         }
     }
     ExitCode::SUCCESS
 }
 
+/// A lot of stderr first, so the last line is still being read when the exit is seen: the last
+/// line is the one that explains the death.
+fn die() -> ExitCode {
+    for n in 0..300 {
+        eprintln!("noise {n} {}", "x".repeat(1000));
+    }
+    eprintln!("boom: the stub died on purpose");
+    ExitCode::from(3)
+}
+
 fn clauses(list: &[(&str, &str)]) -> String {
     let clauses: Vec<Value> = list.iter().map(|(text, gesture)| json!({ "text": text, "gesture": gesture })).collect();
     json!({ "clauses": clauses, "language": "zh-TW", "affect": "calm" }).to_string()
+}
+
+/// The answers given both whole and streamed. Any word not named here is answered as "ok".
+fn answer_to(word: &str) -> Value {
+    let text = match word {
+        "bracket" => clauses(&[("好的", "none"), ("[happy] hi", "none")]),
+        "four" => clauses(&[("一", "nod"), ("二", "none"), ("三", "nod"), ("四", "lookAway")]),
+        // Long enough that the starting pace cuts it into parts.
+        "long" => clauses(&[
+            ("好熱喔，我懂那種不想動的感覺。", "selfRef"),
+            ("要不要先待在家吹冷氣，喝點冰的，", "offer"),
+            ("等傍晚涼一點再出去走走？", "nod"),
+        ]),
+        // A greeting too short to sound for as long as the clause after it takes to voice.
+        "hello" => clauses(&[("早安呀！", "nod"), ("今天天氣很好，我們一起出去走走吧。", "offer")]),
+        // Claims the delivery in her clauses and asks for the relay, the turn that must say nothing.
+        "relayask" => {
+            let mut answer: Value = serde_json::from_str(&clauses(&[("已經幫你傳了", "nod")])).unwrap_or_default();
+            answer["relay"] = json!({ "to": "AImate 那個 session", "text": "設定頁的主題做好了，可以看了。" });
+            return answer;
+        }
+        _ => clauses(&[("收到", "nod"), ("我在這裡", "offer")]),
+    };
+    serde_json::from_str(&text).unwrap_or_default()
 }
 
 /// The `result` message of a good turn. The answer is a string that holds JSON, as it is from the
@@ -169,6 +208,132 @@ fn send(value: &Value) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{value}");
     let _ = out.flush();
+}
+
+fn event(event: Value) {
+    send(&json!({ "type": "stream_event", "event": event }));
+}
+
+/// The answer to `word` streamed the way the real CLI streams a turn (one captured turn is 134
+/// lines of this shape), held after its first clause when `gate` names the file to wait for, then
+/// its `result`, which is the same as the word's unstreamed one. `Some` is the stand-in's exit.
+fn streamed(word: &str, required: &[String], gate: Option<&Path>) -> Option<ExitCode> {
+    let tool_result = |index: u64, error: Option<&str>| {
+        let content = error.unwrap_or("Structured output provided successfully");
+        send(&json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": format!("toolu_stub_{index}"), "content": content, "is_error": error.is_some() }] } }));
+    };
+    event(json!({ "type": "message_start", "message": { "role": "assistant", "content": [] } }));
+    match word {
+        // The first clause of "ok", and then the turn fails instead of going on.
+        "error" | "die" => {
+            attempt(&answer_to("ok"), required, 0, gate, true);
+            if word == "die" {
+                return Some(die());
+            }
+            send(&json!({ "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "the stub failed on purpose" }));
+        }
+        // The CLI asks again when an attempt breaks its schema. The first one opens with the long
+        // answer's first clause and gives its second clause a gesture outside the list; the second
+        // is the long answer, which opens the same, or "ok", which does not. It comes in a message
+        // of its own that thinks first, so its call is block 1 there.
+        "retry-same" | "retry-other" => {
+            let broken: Value = serde_json::from_str(&clauses(&[("好熱喔，我懂那種不想動的感覺。", "selfRef"), ("hi", "happy")])).unwrap_or_default();
+            attempt(&broken, required, 0, gate, false);
+            tool_result(0, Some("Output does not match the required schema: clauses/1/gesture must be one of the allowed values"));
+            event(json!({ "type": "message_stop" }));
+            event(json!({ "type": "message_start", "message": { "role": "assistant", "content": [] } }));
+            event(json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "" } }));
+            event(json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "手勢要從清單裡挑。" } }));
+            event(json!({ "type": "content_block_stop", "index": 0 }));
+            let again = answer_to(if word == "retry-same" { "long" } else { "ok" });
+            attempt(&again, required, 1, None, false);
+            tool_result(1, None);
+            event(json!({ "type": "message_stop" }));
+            send(&success(&again.to_string()));
+        }
+        other => {
+            let answer = answer_to(other);
+            attempt(&answer, required, 0, gate, false);
+            tool_result(0, None);
+            event(json!({ "type": "message_stop" }));
+            send(&success(&answer.to_string()));
+        }
+    }
+    None
+}
+
+/// One attempt at the answer, written as the CLI streams the model's tool call: the call opens as
+/// content block `index`, its JSON arrives in pieces, then the whole input comes in an `assistant`
+/// line and the block closes. With `gate` it is held after the piece that closes the first clause,
+/// and `cut` ends it there.
+fn attempt(answer: &Value, required: &[String], index: u64, gate: Option<&Path>, cut: bool) {
+    let id = format!("toolu_stub_{index}");
+    event(json!({ "type": "content_block_start", "index": index, "content_block": { "type": "tool_use", "id": id, "name": "StructuredOutput", "input": {} } }));
+    let piece = |json: &str| event(json!({ "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": json } }));
+    piece("");
+    let (text, first_end) = written(answer, required);
+    let chars: Vec<char> = text.chars().collect();
+    let mut sent = 0;
+    for chunk in chars.chunks(PIECE_CHARS) {
+        let chunk: String = chunk.iter().collect();
+        piece(&chunk);
+        let before = sent;
+        sent += chunk.len();
+        if before < first_end && first_end <= sent {
+            if let Some(gate) = gate {
+                hold(gate);
+            }
+            if cut {
+                return;
+            }
+        }
+    }
+    send(&json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": id, "name": "StructuredOutput", "input": answer }] } }));
+    event(json!({ "type": "content_block_stop", "index": index }));
+}
+
+/// The answer as the model writes it, and the byte just past its first clause. Top-level keys come
+/// in the order of the schema's `required`, as the real model was seen to keep it, with `relay`
+/// null when it is required and the answer has none, and the others after them. Each clause is
+/// text then gesture, and a space follows each top-level colon and comma, as in the real stream.
+fn written(answer: &Value, required: &[String]) -> (String, usize) {
+    let mut fields: Vec<(String, Value)> = required.iter().map(|key| (key.clone(), answer.get(key).cloned().unwrap_or(Value::Null))).collect();
+    if let Some(map) = answer.as_object() {
+        fields.extend(map.iter().filter(|(key, _)| !required.contains(key)).map(|(key, value)| (key.clone(), value.clone())));
+    }
+    let mut text = String::from("{");
+    let mut first_end = 0;
+    for (n, (key, value)) in fields.iter().enumerate() {
+        if n > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(&format!("{}: ", json!(key)));
+        let Some(clauses) = value.as_array().filter(|_| key == "clauses") else {
+            text.push_str(&value.to_string());
+            continue;
+        };
+        text.push('[');
+        for (at, clause) in clauses.iter().enumerate() {
+            if at > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!("{{\"text\":{},\"gesture\":{}}}", clause["text"], clause["gesture"]));
+            if at == 0 {
+                first_end = text.len();
+            }
+        }
+        text.push(']');
+    }
+    text.push('}');
+    (text, first_end)
+}
+
+fn hold(gate: &Path) {
+    let _ = std::fs::write(held_at(gate), b"");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !gate.exists() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// The sessions the courier lists, chosen so one listing holds every case a title can be in: one

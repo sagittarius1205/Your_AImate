@@ -6,13 +6,13 @@
 
 use crate::character::{Character, DEFAULT_VOICE, Greeting, VoiceId};
 use crate::chat;
-use crate::claude::{self, Line, Msg, Wait};
+use crate::claude::{self, Line, Msg, Stream, Wait};
 use crate::dialogue::{Keep, Via};
 use crate::engine::Engine;
-use crate::pace::{Measured, Pace};
+use crate::pace::{self, HEAD_SYLLABLES, Measured, Pace};
 use crate::protocol::{self, Event, Request, Said};
 use crate::relay::{self, Fact, GateDir, Nonce, Order, Outcome, Seen, SendInput, Step, Unaddressable, Verdict, Why};
-use crate::reply::{self, Atom, Clause, Gesture, Relaying, Reply};
+use crate::reply::{self, Atom, Clause, FirstClause, Gesture, Relaying, Reply, Streamed};
 use crate::scratch::{self, Scratch};
 use crate::serve::{self, Options};
 use crate::voice::{self, Endpoint, Fault, Speech, SpeechEnv, Voice};
@@ -87,6 +87,7 @@ const CASES: &[Case] = &[
     ("claude_is_started_with_the_measured_flags", claude_is_started_with_the_measured_flags),
     ("claude_is_looked_for_on_path_first", claude_is_looked_for_on_path_first),
     ("a_waiting_turn_ends_on_an_answer_a_stop_or_a_silence", a_waiting_turn_ends_on_an_answer_a_stop_or_a_silence),
+    ("a_waiting_turn_hands_over_its_first_clause_once_and_keeps_one_deadline", a_waiting_turn_hands_over_its_first_clause_once_and_keeps_one_deadline),
     ("serve_reads_its_arguments_strictly", serve_reads_its_arguments_strictly),
     ("the_engine_variable_names_claude_or_openai", the_engine_variable_names_claude_or_openai),
     ("the_chat_envelope_gives_the_text_and_nothing_else", the_chat_envelope_gives_the_text_and_nothing_else),
@@ -107,6 +108,8 @@ const CASES: &[Case] = &[
     ("the_next_piece_is_the_longest_run_that_fits_the_lead", the_next_piece_is_the_longest_run_that_fits_the_lead),
     ("the_pace_learns_from_every_voiced_piece", the_pace_learns_from_every_voiced_piece),
     ("a_service_slower_than_real_time_never_splits", a_service_slower_than_real_time_never_splits),
+    ("an_opening_is_the_head_of_its_clause", an_opening_is_the_head_of_its_clause),
+    ("the_first_clause_is_read_the_same_however_the_pieces_fall", the_first_clause_is_read_the_same_however_the_pieces_fall),
     ("relaying_off_is_todays_schema_and_prompt", relaying_off_is_todays_schema_and_prompt),
     ("relaying_on_asks_for_a_nullable_relay", relaying_on_asks_for_a_nullable_relay),
     ("a_relay_is_read_only_when_offered", a_relay_is_read_only_when_offered),
@@ -437,6 +440,27 @@ fn lines_from_claude_are_told_apart(c: &mut Checks) {
         c.eq(claude::classify(other.to_string().as_bytes()), Line::Other, format!("{what} is not the answer"));
     }
     c.eq(claude::classify(b"  \r\n"), Line::Other, "a blank line is nothing");
+
+    // The lines --include-partial-messages adds, in the shape the CLI writes them (2026-11-24
+    // captures): only the answer's tool call and the pieces of its input are handed on.
+    let event = |event: Value| json!({ "type": "stream_event", "event": event, "session_id": "s", "parent_tool_use_id": null }).to_string();
+    let call = json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "toolu_1", "name": "StructuredOutput", "input": {} } });
+    c.eq(claude::classify(event(call).as_bytes()), Line::Stream(Stream::Attempt { index: 1 }), "the answer's tool call opening as block 1");
+    let piece = json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "{\"clauses\": [{\"te" } });
+    c.eq(claude::classify(event(piece).as_bytes()), Line::Stream(Stream::Piece { index: 1, json: "{\"clauses\": [{\"te".to_string() }), "a piece of its input, exactly as written");
+    for (other, what) in [
+        (json!({ "type": "message_start", "message": { "content": [] } }), "a message starting"),
+        (json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "" } }), "a thinking block"),
+        (json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }), "a text block"),
+        (json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "name": "Bash", "input": {} } }), "a call of another tool"),
+        (json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "{\"clauses\":[" } }), "thinking that looks like an answer"),
+        (json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "{\"clauses\":[{\"text\":\"好\",\"gesture\":\"nod\"}]}" } }), "text that looks like an answer"),
+        (json!({ "type": "content_block_delta", "delta": { "type": "input_json_delta", "partial_json": "{" } }), "a piece that says no block"),
+        (json!({ "type": "content_block_stop", "index": 1 }), "a block closing"),
+    ] {
+        c.eq(claude::classify(event(other).as_bytes()), Line::Other, format!("{what} is not the answer"));
+    }
+
     for (line, needle) in [
         (&b"this is not json"[..], "not JSON"),
         (&b"{\"type\":"[..], "not JSON"),
@@ -479,6 +503,11 @@ fn claude_is_started_with_the_measured_flags(c: &mut Checks) {
     c.eq(after("--input-format"), Some("stream-json".to_string()), "stream-json in");
     c.eq(after("--output-format"), Some("stream-json".to_string()), "stream-json out");
     c.that(args.iter().any(|a| a == "--verbose"), "verbose, which stream-json output requires");
+    c.eq(
+        args.iter().filter(|a| *a == "--include-partial-messages").count(),
+        1,
+        "the answer is streamed as it is written, so its first clause can be voiced early; asked once",
+    );
     c.eq(after("--json-schema"), Some(reply::schema(Relaying::Off).to_string()), "the schema is the one reply.rs builds");
     c.eq(after("--append-system-prompt"), Some(reply::prompt(&character, Relaying::Off)), "the prompt is the one reply.rs builds for this character");
     c.that(reply::prompt(&character, Relaying::Off).starts_with("你是一個桌面寵物角色，名字叫阿花。"), "and it is hers and not 小毛's");
@@ -516,35 +545,40 @@ fn claude_is_looked_for_on_path_first(c: &mut Checks) {
     );
 }
 
+/// The wait with nothing done with the stream.
+fn await_result(msgs: &mpsc::Receiver<Msg>, limit: Duration, stop: &AtomicBool) -> Result<Value, Wait> {
+    claude::await_answer(msgs, Instant::now() + limit, stop, &mut |_, _| {}).map(|(answer, _)| answer)
+}
+
 fn a_waiting_turn_ends_on_an_answer_a_stop_or_a_silence(c: &mut Checks) {
     let never = AtomicBool::new(false);
     let long = Duration::from_secs(5);
 
     let (tx, rx) = mpsc::channel();
     let answer = json!({ "type": "result", "result": "x" });
-    let _ = tx.send(Msg::Result(answer.clone()));
-    c.eq(claude::await_result(&rx, long, &never), Ok(answer), "an answer that is already there");
+    let _ = tx.send(Msg::Result(answer.clone(), Instant::now()));
+    c.eq(await_result(&rx, long, &never), Ok(answer), "an answer that is already there");
 
     let (tx, rx) = mpsc::channel();
     let _ = tx.send(Msg::Bad("a line that is not JSON".to_string()));
-    c.eq(claude::await_result(&rx, long, &never), Err(Wait::Bad("a line that is not JSON".to_string())), "a bad line ends the wait");
+    c.eq(await_result(&rx, long, &never), Err(Wait::Bad("a line that is not JSON".to_string())), "a bad line ends the wait");
 
     let (tx, rx) = mpsc::channel();
     let _ = tx.send(Msg::Ended(Some("pipe broke".to_string())));
-    c.eq(claude::await_result(&rx, long, &never), Err(Wait::Ended(Some("pipe broke".to_string()))), "the pipe ending ends the wait");
+    c.eq(await_result(&rx, long, &never), Err(Wait::Ended(Some("pipe broke".to_string()))), "the pipe ending ends the wait");
 
     let (tx, rx) = mpsc::channel::<Msg>();
     drop(tx);
-    c.eq(claude::await_result(&rx, long, &never), Err(Wait::Ended(None)), "a reader that is gone ends the wait");
+    c.eq(await_result(&rx, long, &never), Err(Wait::Ended(None)), "a reader that is gone ends the wait");
 
     let (_tx, rx) = mpsc::channel::<Msg>();
     let began = Instant::now();
-    let silent = claude::await_result(&rx, Duration::from_millis(120), &never);
+    let silent = await_result(&rx, Duration::from_millis(120), &never);
     c.eq(silent, Err(Wait::Timeout), "silence runs out");
     c.that(began.elapsed() >= Duration::from_millis(100) && began.elapsed() < Duration::from_secs(2), format!("after about the time asked, not {:?}", began.elapsed()));
 
     let stopped = AtomicBool::new(true);
-    c.eq(claude::await_result(&rx, long, &stopped), Err(Wait::Stopped), "a stop that was already raised");
+    c.eq(await_result(&rx, long, &stopped), Err(Wait::Stopped), "a stop that was already raised");
 
     // A stop raised while the wait is under way must end it long before the limit does.
     let (_tx, rx) = mpsc::channel::<Msg>();
@@ -555,10 +589,77 @@ fn a_waiting_turn_ends_on_an_answer_a_stop_or_a_silence(c: &mut Checks) {
             thread::sleep(Duration::from_millis(60));
             stop.store(true, Ordering::Relaxed);
         });
-        claude::await_result(&rx, long, &stop)
+        await_result(&rx, long, &stop)
     });
     c.eq(got, Err(Wait::Stopped), "a stop raised during the wait");
     c.that(began.elapsed() < Duration::from_secs(1), format!("and it ends the wait at once, not after {:?}", began.elapsed()));
+}
+
+/// The pieces of one attempt at `answer`, five characters each, as the CLI streams them.
+fn pieces_of(answer: &str, index: u64, read: Instant) -> Vec<Msg> {
+    let chars: Vec<char> = answer.chars().collect();
+    let attempt = Msg::Stream(Stream::Attempt { index }, read);
+    let pieces = chars.chunks(5).map(|chunk| Msg::Stream(Stream::Piece { index, json: chunk.iter().collect() }, read));
+    std::iter::once(attempt).chain(pieces).collect()
+}
+
+fn a_waiting_turn_hands_over_its_first_clause_once_and_keeps_one_deadline(c: &mut Checks) {
+    let never = AtomicBool::new(false);
+    let now = Instant::now();
+    let soon = now + Duration::from_secs(5);
+    let first_try = r#"{"clauses": [{"text":"好的","gesture":"none"},{"text":"hi","gesture":"happy"}], "language": "zh-TW", "affect": "calm"}"#;
+    let second_try = r#"{"clauses": [{"text":"收到","gesture":"nod"}], "language": "zh-TW", "affect": "calm"}"#;
+    let result = json!({ "type": "result", "result": second_try });
+
+    let (tx, rx) = mpsc::channel();
+    let early = now.checked_sub(Duration::from_millis(30)).unwrap_or(now);
+    for msg in pieces_of(first_try, 0, early).into_iter().chain(pieces_of(second_try, 1, now)) {
+        let _ = tx.send(msg);
+    }
+    let _ = tx.send(Msg::Result(result.clone(), now));
+    let mut heard = Vec::new();
+    let got = claude::await_answer(&rx, soon, &never, &mut |clause, at| heard.push((clause, at)));
+    c.eq(got, Ok((result.clone(), now)), "the answer comes back with when it was read");
+    c.eq(
+        heard,
+        vec![(Ok(Clause { text: "好的".to_string(), gesture: Gesture::None }), early)],
+        "the first attempt's first clause is handed over once, with when its piece was read, and the second attempt's is not",
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let _ = tx.send(Msg::Stream(Stream::Piece { index: 0, json: "{\"clauses\": [".to_string() }, now));
+    for msg in pieces_of(second_try, 0, now) {
+        let _ = tx.send(msg);
+    }
+    let _ = tx.send(Msg::Result(result.clone(), now));
+    let mut heard = Vec::new();
+    let _ = claude::await_answer(&rx, soon, &never, &mut |clause, _| heard.push(clause));
+    c.that(
+        matches!(heard.as_slice(), [Err(why)] if why.contains("before the answer's tool call")),
+        format!("a piece before any tool call ends the reading for the turn, and says why: {heard:?}"),
+    );
+
+    let (tx, rx) = mpsc::channel();
+    for msg in pieces_of(&second_try[..20], 0, now).into_iter().chain(pieces_of(second_try, 1, now)) {
+        let _ = tx.send(msg);
+    }
+    let _ = tx.send(Msg::Result(result.clone(), now));
+    let mut heard = Vec::new();
+    let _ = claude::await_answer(&rx, soon, &never, &mut |clause, _| heard.push(clause));
+    c.that(
+        matches!(heard.as_slice(), [Err(why)] if why.contains("began the answer again")),
+        format!("an attempt that ends before its first clause closes leaves the next one unread: {heard:?}"),
+    );
+
+    // Past the deadline, as when the first clause was being voiced: what was read in time is the
+    // answer, what was read after it is not.
+    let passed = now;
+    let (tx, rx) = mpsc::channel();
+    let _ = tx.send(Msg::Result(result.clone(), passed.checked_sub(Duration::from_millis(1)).unwrap_or(passed)));
+    c.that(claude::await_answer(&rx, passed, &never, &mut |_, _| {}).is_ok(), "a result read by the deadline is the answer, though it was looked at after");
+    let (tx, rx) = mpsc::channel();
+    let _ = tx.send(Msg::Result(result, passed + Duration::from_millis(1)));
+    c.eq(claude::await_answer(&rx, passed, &never, &mut |_, _| {}).map(|_| ()), Err(Wait::Timeout), "a result read after the deadline is not");
 }
 
 fn serve_reads_its_arguments_strictly(c: &mut Checks) {
@@ -1206,6 +1307,15 @@ fn the_character_and_greet_requests_are_read_and_checked_from_the_wire(c: &mut C
         Ok(Request::Say { text: "hi".to_string(), keep: None }),
         "a null record keeps nothing",
     );
+    // A pet from before the opening was settled sent `early` with whatever its setting was. A key a
+    // say does not know is ignored, so the line is a plain say whatever the value.
+    for early in [r#""clause""#, r#""head""#, r#""whole""#, "true", "null", "1"] {
+        c.eq(
+            protocol::parse(format!(r#"{{"early":{early},"op":"say","text":"hi"}}"#).as_bytes()),
+            Ok(Request::Say { text: "hi".to_string(), keep: None }),
+            format!("an older pet's \"early\":{early} is ignored"),
+        );
+    }
     c.eq(protocol::parse(br#"{"op":"shutdown"}"#), Ok(Request::Shutdown), "and so does shutdown");
 
     let name33 = "字".repeat(33);
@@ -1393,6 +1503,98 @@ fn a_service_slower_than_real_time_never_splits(c: &mut Checks) {
     for atoms in [&[30, 3][..], &[10, 10], &[3, 10, 10, 4, 11], &[20, 1, 1], &[50, 1]] {
         c.eq(at(1.01).first(atoms), atoms.len(), format!("one slower than real time sends {atoms:?} as one piece"));
     }
+}
+
+fn an_opening_is_the_head_of_its_clause(c: &mut Checks) {
+    // The stand-in's long answer opens with 好熱喔，我懂那種不想動的感覺。, 3 syllables and then 10.
+    c.eq(pace::head(&[3, 10]), 1, "the head of a clause ends at its first punctuation");
+    c.eq(pace::head(&[1, 8]), 2, "a head of one syllable, 欸，, takes the atom after it");
+    c.eq(pace::head(&[HEAD_SYLLABLES, 8]), 1, "a head of HEAD_SYLLABLES stands alone");
+    c.eq(pace::head(&[5]), 1, "a clause of one atom is voiced whole");
+    c.eq(pace::head(&[1]), 1, "and so is one of one syllable");
+}
+
+/// What a stream of these pieces makes of its first clause: closed and taken, not closed yet, or
+/// never.
+fn first_clause_of<'a>(pieces: impl IntoIterator<Item = &'a str>) -> Result<Option<Clause>, String> {
+    let mut reading = FirstClause::new();
+    for piece in pieces {
+        match reading.push(piece) {
+            Streamed::Open(next) => reading = next,
+            Streamed::Closed(clause) => return Ok(Some(clause)),
+            Streamed::Never(why) => return Err(why),
+        }
+    }
+    Ok(None)
+}
+
+/// What `parse` makes of the answer's own first element as the only clause, which is all the stream
+/// may hand over. `None` when the answer has no first element.
+fn parse_takes(answer: &str) -> Option<Result<Clause, String>> {
+    let value: Value = serde_json::from_str(answer).ok()?;
+    let first = value.get("clauses")?.get(0)?.clone();
+    let reply = reply::parse(&json!({ "clauses": [first] }).to_string(), Relaying::Off);
+    Some(reply.and_then(|r| r.clauses.into_iter().next().ok_or_else(|| "no clause".to_string())))
+}
+
+fn the_first_clause_is_read_the_same_however_the_pieces_fall(c: &mut Checks) {
+    let answers = [
+        // As the model writes it: spaces after the top-level colons, and clause 1 opening in the
+        // piece that closes clause 0.
+        r#"{"clauses": [{"text":"好熱喔，我懂那種不想動的感覺。","gesture":"selfRef"},{"text":"要不要先待在家吹冷氣？","gesture":"offer"}], "language": "zh-TW", "affect": "calm"}"#,
+        // Escapes of every kind in the text, and a key spelled with one.
+        r#"{"cla\u0075ses":[{"text":"她說\"嗨\"\\好\u5440\n","gesture":"nod"}],"language":"zh-TW","affect":"calm"}"#,
+        // An escaped quote does not end the string, so the brace after it is text.
+        r#"{"clauses":[{"text":"引號\" 之後的 } 還是字","gesture":"none"}],"language":"zh-TW","affect":"calm"}"#,
+        // Braces, commas and colons inside a string are text.
+        r#"{"clauses":[{"text":"大括號 } 還有 {、逗號 , 和冒號 :","gesture":"none"}],"language":"zh-TW","affect":"calm"}"#,
+        // Other keys first, and gesture before text.
+        r#"{"relay":null,"language":"zh-TW","affect":"calm","clauses":[{"gesture":"lookAway","text":"嗯……讓我想想"}]}"#,
+        // A `clauses` nested in another value, and one written inside a string, are not the answer's.
+        r#"{"relay":{"to":"x","text":"y","clauses":[{"text":"假的","gesture":"nod"}]},"language":"\"clauses\": [{\"text\":\"也是假的\",\"gesture\":\"nod\"}]","clauses":[{"text":"真的","gesture":"offer"}],"affect":"calm"}"#,
+        // A later clause that `parse` refuses does not hold the first one back.
+        r#"{"clauses":[{"text":"好的","gesture":"none"},{"text":"[happy] hi","gesture":"none"}],"language":"zh-TW","affect":"calm"}"#,
+        // A first clause `parse` refuses is never handed over.
+        r#"{"clauses":[{"text":"[happy] 好","gesture":"none"}],"language":"zh-TW","affect":"calm"}"#,
+        r#"{"clauses":[{"text":"好","gesture":"happy"}],"language":"zh-TW","affect":"calm"}"#,
+        r#"{"clauses":[{"text":"  ","gesture":"nod"}],"language":"zh-TW","affect":"calm"}"#,
+        r#"{"clauses":[{"text":"好"}],"language":"zh-TW","affect":"calm"}"#,
+        r#"{"clauses":["好"],"language":"zh-TW","affect":"calm"}"#,
+        // No first clause at all.
+        r#"{"clauses":[],"language":"zh-TW","affect":"calm"}"#,
+        r#"{"clauses":"好","language":"zh-TW","affect":"calm"}"#,
+        r#"{"language":"zh-TW","affect":"calm"}"#,
+        r#"[{"text":"好","gesture":"nod"}]"#,
+    ];
+    for answer in answers {
+        let whole = first_clause_of([answer]);
+        let agrees = match (&whole, parse_takes(answer)) {
+            (Ok(Some(got)), Some(Ok(want))) => *got == want,
+            (Err(_), Some(Err(_)) | None) => true,
+            _ => false,
+        };
+        c.that(agrees, format!("{answer}: the stream gives {whole:?}, and parse takes {:?} as its first clause", parse_takes(answer)));
+        let cuts: Vec<usize> = answer.char_indices().map(|(at, _)| at).chain([answer.len()]).collect();
+        let split = cuts.iter().find(|&&at| first_clause_of([&answer[..at], &answer[at..]]) != whole);
+        c.eq(split, None, format!("{answer} read in two pieces cut anywhere reads as it does whole"));
+        let one_by_one = first_clause_of(cuts.windows(2).map(|w| &answer[w[0]..w[1]]));
+        c.eq(one_by_one, whole, format!("{answer} read one character at a time"));
+    }
+
+    let streamed = answers[0];
+    let close = streamed.find(r#""selfRef"}"#).map_or(0, |at| at + r#""selfRef""#.len());
+    let early = streamed.char_indices().map(|(at, _)| at).filter(|&at| at <= close).find(|&at| first_clause_of([&streamed[..at]]) != Ok(None));
+    c.eq(early, None, "nothing is handed over before the brace that closes the clause, and nothing broken off is repaired");
+    c.eq(
+        first_clause_of([&streamed[..=close]]),
+        Ok(Some(Clause { text: "好熱喔，我懂那種不想動的感覺。".to_string(), gesture: Gesture::SelfRef })),
+        "and that brace makes it the first clause",
+    );
+    c.eq(
+        first_clause_of([r#"{"clauses":[{"text":"好","gesture":"happy"}]}"#]),
+        parse_takes(r#"{"clauses":[{"text":"好","gesture":"happy"}]}"#).map_or(Ok(None), |taken| taken.map(Some)),
+        "a first clause parse refuses is refused in parse's words",
+    );
 }
 
 // Relaying.

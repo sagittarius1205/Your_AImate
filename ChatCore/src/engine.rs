@@ -15,10 +15,10 @@ use crate::character::{Character, Greeting, VoiceId};
 use crate::chat::{self, ChatEnv, History};
 use crate::claude::{self, Failure, Proc, StartError};
 use crate::dialogue::{Answer, Heard, Keep, Log, Outcome, Took, Who};
-use crate::pace::{Measured, Pace};
+use crate::pace::{self, Measured, Pace};
 use crate::protocol::Event;
 use crate::relay::Fact;
-use crate::reply::{self, Atom, RelayAsk, Relaying, Reply};
+use crate::reply::{self, Atom, Clause, RelayAsk, Relaying, Reply};
 use crate::scratch;
 use crate::voice::{Speaker, Voice};
 use std::ffi::OsString;
@@ -215,7 +215,7 @@ fn work(config: &Config, queue: &Receiver<Job>, stop: &AtomicBool, sink: &Sink) 
                 Ok(())
             }
             Job::Greet(greeting) => {
-                let spoke = speak(&reply::echo(greeting.into_text()), &mut pace, &config.speaker, character.voice(), stop, sink);
+                let spoke = speak(&reply::echo(greeting.into_text()), None, &mut pace, &config.speaker, character.voice(), stop, sink);
                 log.greeted();
                 spoke.map(|_| ())
             }
@@ -241,13 +241,13 @@ fn work(config: &Config, queue: &Receiver<Job>, stop: &AtomicBool, sink: &Sink) 
 /// One sentence, answered and sent, and what it came to. An outcome that is not `answered()` is a
 /// sentence the client has been told was not answered, and the engine may not have heard it.
 fn say(text: &str, backend: &mut Backend, character: &Character, pace: &mut Pace, config: &Config, stop: &AtomicBool, sink: &Sink) -> Result<Took, Halt> {
-    let turn = match backend {
-        Backend::Echo { .. } => Turn::Said { atoms: reply::echo(text.to_string()), answer: Answer::echo(text) },
+    let (turn, engine) = match backend {
+        Backend::Echo { .. } => (Turn::Said { atoms: reply::echo(text.to_string()), answer: Answer::echo(text), opening: None }, Instant::now()),
         Backend::Claude { proc } => {
             let began = Instant::now();
-            let turn = claude_turn(proc, config, character, text, stop);
-            eprintln!("vrchatcore: claude answered in {:.0} ms", began.elapsed().as_secs_f64() * 1000.0);
-            turn
+            let (turn, answered) = claude_turn(proc, config, character, text, pace, stop, began);
+            eprintln!("vrchatcore: claude answered in {:.0} ms", ms(answered.saturating_duration_since(began)));
+            (turn, answered)
         }
         Backend::Openai { client, history } => {
             let began = Instant::now();
@@ -255,19 +255,18 @@ fn say(text: &str, backend: &mut Backend, character: &Character, pace: &mut Pace
             let turn = openai_turn(client, history, character, text, stop);
             eprintln!(
                 "vrchatcore: openai answered in {:.0} ms ({sent} turns of history sent{})",
-                began.elapsed().as_secs_f64() * 1000.0,
+                ms(began.elapsed()),
                 match &turn {
                     Turn::Refused(why) | Turn::Failed(why) => format!(", failed: {why}"),
                     _ => String::new(),
                 }
             );
-            turn
+            (turn, Instant::now())
         }
     };
-    let engine = Instant::now();
     let unspoken = |sent: Result<(), Halt>| sent.map(|()| Spoke { first: None, audio: 0.0 });
     let (outcome, answer, spoke) = match turn {
-        Turn::Said { atoms, answer } => (Outcome::Answered, Some(answer), speak(&atoms, pace, &config.speaker, character.voice(), stop, sink)),
+        Turn::Said { atoms, answer, opening } => (Outcome::Answered, Some(answer), speak(&atoms, opening, pace, &config.speaker, character.voice(), stop, sink)),
         // Her clauses are dropped: nothing she wrote this turn is said, so nothing she wrote can
         // claim an outcome. The pet answers in fixed words.
         Turn::Relay(ask) => (
@@ -353,12 +352,53 @@ struct Spoke {
     audio: f64,
 }
 
+/// Part 0 voiced while the rest of the answer was still being written: the head of the first
+/// clause, said as `speak` would say it. Nothing of it is sent until the whole answer has passed
+/// `parse` and `speak` has judged it against that answer.
+struct Opening {
+    atoms: Vec<Atom>,
+    voice: Voice,
+    /// Seconds the service took for it.
+    synthesis: f64,
+}
+
+/// Voices the opening of `clause`, on this thread, while the reader takes in the rest of the answer.
+/// A service slower than real time is not asked: it never splits an answer, so its first part is
+/// the whole answer and has to wait for it.
+fn prepare(clause: &Clause, pace: &Pace, speaker: &Speaker, voice: &VoiceId) -> Option<Opening> {
+    if pace.rate > 1.0 {
+        eprintln!("vrchatcore: no opening, the speech service is slower than real time");
+        return None;
+    }
+    let mut atoms = clause.atoms();
+    let syllables: Vec<usize> = atoms.iter().map(|atom| atom.syllables).collect();
+    atoms.truncate(pace::head(&syllables));
+    let began = Instant::now();
+    let voice = speaker.voice(&reply::said(&atoms).spoken(), voice);
+    Some(Opening { atoms, voice, synthesis: began.elapsed().as_secs_f64() })
+}
+
+/// What becomes of an opening once the answer is whole, and the word the part 0 line says it with.
+/// It is part 0 when the answer begins with exactly its atoms, whatever pause that leaves in front
+/// of the piece after it. One the service could not voice is the turn's silence, as a first part the
+/// service refuses always was, whatever the answer turned out to be.
+fn judge(opening: Option<Opening>, atoms: &[Atom]) -> (Option<Opening>, &'static str) {
+    let Some(opening) = opening else { return (None, "none") };
+    match &opening.voice {
+        Voice::Silent { .. } => (Some(opening), "silent"),
+        Voice::Voiced(_) if !atoms.starts_with(&opening.atoms) => (None, "dropped:changed"),
+        Voice::Voiced(_) => (Some(opening), "reused"),
+    }
+}
+
 /// Sends an answer in parts, each as soon as its voice is ready, and then `turn_end`. `pace` cuts
 /// the parts: the first from its estimates alone, every later one from how much of the audio
-/// already sent is still to play, and each voiced part teaches it.
-fn speak(atoms: &[Atom], pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, stop: &AtomicBool, sink: &Sink) -> Result<Spoke, Halt> {
+/// already sent is still to play, and each voiced part teaches it. An `opening` that `judge` keeps
+/// is part 0, and teaches the pace once, with the time its synthesis really took.
+fn speak(atoms: &[Atom], opening: Option<Opening>, pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, stop: &AtomicBool, sink: &Sink) -> Result<Spoke, Halt> {
     let mut spoke = Spoke { first: None, audio: 0.0 };
     let syllables: Vec<usize> = atoms.iter().map(|atom| atom.syllables).collect();
+    let (mut ready, verdict) = judge(opening, atoms);
     // When the page runs out of what it has been sent. Playback is taken to start when part 0 is
     // sent; each later part plays after it, or at once if it arrives after the end.
     let mut playback_end: Option<Instant> = None;
@@ -368,19 +408,23 @@ fn speak(atoms: &[Atom], pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, st
         halted(stop)?;
         let rest = &syllables[at..];
         let lead = playback_end.map(|end| end.saturating_duration_since(Instant::now()).as_secs_f64());
-        let n = lead.map_or_else(|| pace.first(rest), |lead| pace.next(rest, lead));
-        let piece: usize = rest[..n].iter().sum();
-        let said = reply::said(&atoms[at..at + n]);
-        let began = Instant::now();
-        let heard = speaker.voice(&said.spoken(), voice);
-        let synthesis = began.elapsed().as_secs_f64();
+        let (n, heard, synthesis) = match ready.take() {
+            Some(opening) => (opening.atoms.len(), opening.voice, opening.synthesis),
+            None => {
+                let n = lead.map_or_else(|| pace.first(rest), |lead| pace.next(rest, lead));
+                let began = Instant::now();
+                let heard = speaker.voice(&reply::said(&atoms[at..at + n]).spoken(), voice);
+                (n, heard, began.elapsed().as_secs_f64())
+            }
+        };
+        let opened = if part == 0 { format!("; opening={verdict}") } else { String::new() };
         let speech = match heard {
             Voice::Voiced(speech) => speech,
             Voice::Silent { why } => {
                 // This part and everything after it go out as one silent utterance, and the service
                 // is asked nothing more this turn: one that just failed would most likely fail again.
                 eprintln!(
-                    "vrchatcore: part {part} silent after {:.0} ms, and so is the rest of the turn ({} syllables): {why}",
+                    "vrchatcore: part {part} silent after {:.0} ms, and so is the rest of the turn ({} syllables{opened}): {why}",
                     synthesis * 1000.0,
                     rest.iter().sum::<usize>()
                 );
@@ -389,6 +433,8 @@ fn speak(atoms: &[Atom], pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, st
                 break;
             }
         };
+        let piece: usize = rest[..n].iter().sum();
+        let said = reply::said(&atoms[at..at + n]);
         let audio = speech.seconds();
         pace.learn(Measured { syllables: piece, audio, synthesis });
         let sent = Instant::now();
@@ -400,7 +446,7 @@ fn speak(atoms: &[Atom], pace: &mut Pace, speaker: &Speaker, voice: &VoiceId, st
             _ => "first".to_string(),
         };
         eprintln!(
-            "vrchatcore: part {part}: {piece} syllables, {audio:.2} s of audio in {:.0} ms, {queued}; pace now {:.3} s per audio s, {:.3} s per syllable",
+            "vrchatcore: part {part}: {piece} syllables, {audio:.2} s of audio in {:.0} ms, {queued}; pace now {:.3} s per audio s, {:.3} s per syllable{opened}",
             synthesis * 1000.0,
             pace.rate,
             pace.per_syllable
@@ -481,7 +527,9 @@ fn error(message: String) -> Event {
 
 /// What an engine made of one sentence.
 enum Turn {
-    Said { atoms: Vec<Atom>, answer: Answer },
+    /// `opening` is part 0 voiced while the answer was being written, for `speak` to judge. Only a
+    /// turn that is said carries one, so a relay, a refusal or a failure drops it unheard.
+    Said { atoms: Vec<Atom>, answer: Answer, opening: Option<Opening> },
     /// She asked for a relay, and said nothing that will be heard.
     Relay(RelayAsk),
     /// The engine answered and `reply::parse` turned it down. The reason is told as an `error`.
@@ -492,8 +540,8 @@ enum Turn {
     Stopped,
 }
 
-fn said(reply: &Reply) -> Turn {
-    Turn::Said { atoms: reply.atoms(), answer: Answer::of(reply) }
+fn said(reply: &Reply, opening: Option<Opening>) -> Turn {
+    Turn::Said { atoms: reply.atoms(), answer: Answer::of(reply), opening }
 }
 
 /// One sentence through the HTTP engine. The turn joins the history only once `parse` has taken
@@ -503,7 +551,7 @@ fn openai_turn(client: &chat::Client, history: &mut History, character: &Charact
         Ok(answered) => match reply::parse(&answered, Relaying::Off) {
             Ok(reply) => {
                 history.push(text, &answered);
-                said(&reply)
+                said(&reply, None)
             }
             Err(why) => Turn::Refused(why),
         },
@@ -512,8 +560,14 @@ fn openai_turn(client: &chat::Client, history: &mut History, character: &Charact
     }
 }
 
-/// One sentence through `claude`.
-fn claude_turn(slot: &mut Option<Proc>, config: &Config, character: &Character, text: &str, stop: &AtomicBool) -> Turn {
+fn ms(time: Duration) -> f64 {
+    time.as_secs_f64() * 1000.0
+}
+
+/// One sentence through `claude`, asked at `began`, and when its answer or its failure came back:
+/// the instant the reader read `result`, because the engine may have been busy voicing the opening
+/// when it arrived. `pace` is what `prepare` asks whether the service can keep up.
+fn claude_turn(slot: &mut Option<Proc>, config: &Config, character: &Character, text: &str, pace: &Pace, stop: &AtomicBool, began: Instant) -> (Turn, Instant) {
     // A process that left while nobody was talking to it has not eaten this sentence yet, so it is
     // replaced without making the sentence pay for it.
     if slot.as_mut().is_some_and(|proc| proc.exited().is_some()) {
@@ -525,25 +579,52 @@ fn claude_turn(slot: &mut Option<Proc>, config: &Config, character: &Character, 
     if slot.is_none() {
         match launch(config, character) {
             Ok(proc) => *slot = Some(proc),
-            Err(e) => return Turn::Failed(e.describe()),
+            Err(e) => return (Turn::Failed(e.describe()), Instant::now()),
         }
     }
     let Some(proc) = slot.as_mut() else {
-        return Turn::Failed("claude is not running".to_string());
+        return (Turn::Failed("claude is not running".to_string()), Instant::now());
     };
-    match proc.ask(text, config.turn_timeout, stop) {
-        Ok(message) => match claude::result(&message).map(|text| reply::parse(text, config.relaying)) {
-            Ok(Ok(Reply { relay: Some(ask), .. })) => Turn::Relay(ask),
-            Ok(Ok(reply)) => said(&reply),
-            Ok(Err(why)) => Turn::Refused(why),
-            Err(why) => Turn::Failed(why),
-        },
-        Err(Failure::Stopped) => Turn::Stopped,
+    let mut opening = None;
+    let mut first = |heard: Result<Clause, String>, read: Instant| match heard {
+        Ok(clause) => {
+            eprintln!("vrchatcore: first clause closed at {:.0} ms", ms(read.saturating_duration_since(began)));
+            opening = prepare(&clause, pace, &config.speaker, character.voice());
+            if let Some(ready) = &opening {
+                let syllables: usize = ready.atoms.iter().map(|atom| atom.syllables).sum();
+                let voiced = match &ready.voice {
+                    Voice::Voiced(speech) => format!("{:.2} s of audio", speech.seconds()),
+                    Voice::Silent { why } => format!("silent ({why})"),
+                };
+                eprintln!("vrchatcore: opening ready at {:.0} ms: {syllables} syllables, {voiced}, in {:.0} ms", ms(began.elapsed()), ready.synthesis * 1000.0);
+            }
+        }
+        Err(why) => eprintln!("vrchatcore: no first clause from the stream: {why}"),
+    };
+    let asked = proc.ask(text, config.turn_timeout, stop, &mut first);
+    let unsaid = |why: &str| {
+        if opening.is_some() {
+            eprintln!("vrchatcore: nothing of this turn is said; opening=dropped:{why}");
+        }
+    };
+    match asked {
+        Ok((message, read)) => {
+            let (turn, outcome) = match claude::result(&message).map(|text| reply::parse(text, config.relaying)) {
+                Ok(Ok(Reply { relay: Some(ask), .. })) => (Turn::Relay(ask), "relay"),
+                Ok(Ok(reply)) => return (said(&reply, opening), read),
+                Ok(Err(why)) => (Turn::Refused(why), "refused"),
+                Err(why) => (Turn::Failed(why), "failed"),
+            };
+            unsaid(outcome);
+            (turn, read)
+        }
+        Err(Failure::Stopped) => (Turn::Stopped, Instant::now()),
         Err(Failure::Broken(why)) => {
+            unsaid("failed");
             if let Some(proc) = slot.take() {
                 proc.close();
             }
-            Turn::Failed(why)
+            (Turn::Failed(why), Instant::now())
         }
     }
 }

@@ -17,6 +17,24 @@ pub const OVERHEAD: f64 = 0.2;
 /// How far one voiced piece moves the pace toward what it measured. Half: a service that changes
 /// speed is followed within a turn, and one odd clip moves the pace only half of the way.
 const LEARNING: f64 = 0.5;
+/// The fewest syllables the opening has. A lone interjection such as 欸， is one, and alone it
+/// played 0.8 s and left 0.95 s of silence in front of the piece after it (Docs/DESIGN_ChatCore.md
+/// 15.9), so it takes the atoms after it until it has this many. 2 is a guess, there to be set by
+/// lin's ear: every number that stood in for that ear before turned out wrong.
+pub const HEAD_SYLLABLES: usize = 2;
+
+/// How many atoms of the first clause, `syllables` each, are voiced while the rest of the answer is
+/// written: the clause up to its first punctuation, or further until it has `HEAD_SYLLABLES`.
+pub fn head(syllables: &[usize]) -> usize {
+    let mut run = 0;
+    syllables
+        .iter()
+        .position(|&atom| {
+            run += atom;
+            run >= HEAD_SYLLABLES
+        })
+        .map_or(syllables.len(), |last| last + 1)
+}
 
 /// What the core believes about the speech service. One per engine, learned from every voiced
 /// piece, so a slower or faster service paces itself.

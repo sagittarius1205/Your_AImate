@@ -4,13 +4,16 @@
 // process is started with the neutral directory as its cwd, because the CLI puts the working
 // directory's git state and CLAUDE.md into the character's context and neither `--tools ""` nor
 // `--restricted` stops it. `--effort` is deliberately not here: how long the model thinks is not
-// the cost being attacked, the process start and the carrying are.
+// the cost being attacked, the process start and the carrying are. `--include-partial-messages`
+// is: with it the CLI streams the answer's JSON as the model writes it, so the first clause can be
+// voiced while the rest is still being written (Docs/DESIGN_ChatCore.md §15).
 //
 // Nothing in this file decides what an answer means. It hands back the `result` message and
-// `answer` turns that into a `Reply` through the checks in `reply.rs`.
+// `answer` turns that into a `Reply` through the checks in `reply.rs`. From the stream it hands
+// over the first clause, which `reply::FirstClause` has checked, and nothing else.
 
 use crate::character::Character;
-use crate::reply::{self, Relaying, Reply};
+use crate::reply::{self, Clause, FirstClause, Relaying, Reply, Streamed};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -18,7 +21,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,7 +72,7 @@ pub fn candidates(explicit: Option<OsString>, home: Option<OsString>) -> Vec<OsS
 /// what would run (the program, the flags, the directory) without running anything.
 pub fn command(program: &OsStr, cwd: &Path, model: &str, character: &Character, relaying: Relaying) -> Command {
     let mut cmd = Command::new(program);
-    cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
+    cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
         .arg("--json-schema")
         .arg(reply::schema(relaying).to_string())
         .arg("--append-system-prompt")
@@ -119,11 +122,28 @@ pub enum Line {
     Result(Value),
     /// The process announcing itself. Carries the model and the directory it really runs in.
     Init(Value),
-    /// Every other message. A turn is made of many (assistant text, rate limits) and none of them
-    /// is the answer.
+    /// The answer as it is being written.
+    Stream(Stream),
+    /// Every other message. A turn is made of many (assistant text, thinking, rate limits) and
+    /// none of them is the answer.
     Other,
     /// Not a message at all. The stream can no longer be trusted to line up with the questions.
     Bad(String),
+}
+
+/// The name of the tool `--json-schema` adds, which the model answers by calling (measured: every
+/// streamed turn of Docs/MEASURE_TurnLatency.md has one block of it).
+pub const ANSWER_TOOL: &str = "StructuredOutput";
+
+/// What `--include-partial-messages` adds that the answer is made of. Nothing here is judged: which
+/// pieces belong to which attempt is `await_answer`'s, and what they say is `reply::FirstClause`'s.
+#[derive(Debug, PartialEq)]
+pub enum Stream {
+    /// The model begins a call of `ANSWER_TOOL`, content block `index` of its message: one attempt
+    /// at the answer. The CLI asks again when an attempt fails its schema, so a turn can hold more.
+    Attempt { index: u64 },
+    /// A piece of the JSON input of the tool call in block `index`.
+    Piece { index: u64, json: String },
 }
 
 pub fn classify(line: &[u8]) -> Line {
@@ -145,7 +165,28 @@ pub fn classify(line: &[u8]) -> Line {
     match (value.get("type").and_then(Value::as_str), value.get("subtype").and_then(Value::as_str)) {
         (Some("result"), _) => Line::Result(value),
         (Some("system"), Some("init")) => Line::Init(value),
+        (Some("stream_event"), _) => value.get("event").and_then(stream).map_or(Line::Other, Line::Stream),
         _ => Line::Other,
+    }
+}
+
+/// The two kinds of stream event the answer is made of. Thinking, text and every other event are
+/// not the answer, so they are not handed on.
+fn stream(event: &Value) -> Option<Stream> {
+    let index = event.get("index").and_then(Value::as_u64)?;
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    match event.get("type").and_then(Value::as_str)? {
+        "content_block_start" => {
+            let block = event.get("content_block")?;
+            let answer = text(block, "type").as_deref() == Some("tool_use") && text(block, "name").as_deref() == Some(ANSWER_TOOL);
+            answer.then_some(Stream::Attempt { index })
+        }
+        "content_block_delta" => {
+            let delta = event.get("delta")?;
+            let input = text(delta, "type").as_deref() == Some("input_json_delta");
+            input.then(|| text(delta, "partial_json")).flatten().map(|json| Stream::Piece { index, json })
+        }
+        _ => None,
     }
 }
 
@@ -174,9 +215,13 @@ pub fn result(message: &Value) -> Result<&str, String> {
     }
 }
 
-/// What came off the pipe, already told apart so the waiting side only decides.
+/// What came off the pipe, already told apart so the waiting side only decides. The answer and its
+/// stream carry the instant the reader read them: the side that waits can be busy voicing the
+/// first clause while they queue, and how long the model took is when they came, not when they
+/// were looked at.
 pub enum Msg {
-    Result(Value),
+    Result(Value, Instant),
+    Stream(Stream, Instant),
     Bad(String),
     /// A line as it came, from a process started with `Lines::All`.
     Raw(Vec<u8>),
@@ -192,23 +237,76 @@ pub enum Wait {
     Stopped,
 }
 
-/// Waits for the answer to the question just asked. Looks up every `POLL` to see whether the core
-/// is shutting down, so a turn in flight never keeps the core from leaving.
-pub fn await_result(msgs: &Receiver<Msg>, limit: Duration, stop: &AtomicBool) -> Result<Value, Wait> {
-    let deadline = Instant::now() + limit;
+/// Where a turn's stream stands on its first clause. Only the first attempt at the answer is read
+/// for it, and it is handed over once at most: whatever a later attempt writes waits for `result`
+/// like the rest of the answer.
+enum FirstAttempt {
+    Waiting,
+    Reading { index: u64, clause: FirstClause },
+    Done,
+}
+
+impl FirstAttempt {
+    /// The first clause, or why the stream will not give one, the first time either is known.
+    fn hear(&mut self, moment: Stream) -> Option<Result<Clause, String>> {
+        let surprise = |why: &str| Some(Err(why.to_string()));
+        match (std::mem::replace(self, FirstAttempt::Done), moment) {
+            (FirstAttempt::Waiting, Stream::Attempt { index }) => {
+                *self = FirstAttempt::Reading { index, clause: FirstClause::new() };
+                None
+            }
+            (FirstAttempt::Waiting, Stream::Piece { .. }) => surprise("a piece of input came before the answer's tool call began"),
+            (FirstAttempt::Reading { index, clause }, Stream::Piece { index: of, json }) if of == index => match clause.push(&json) {
+                Streamed::Open(clause) => {
+                    *self = FirstAttempt::Reading { index, clause };
+                    None
+                }
+                Streamed::Closed(clause) => Some(Ok(clause)),
+                Streamed::Never(why) => Some(Err(why)),
+            },
+            (FirstAttempt::Reading { .. }, Stream::Piece { .. }) => surprise("a piece of another content block came inside the answer"),
+            (FirstAttempt::Reading { .. }, Stream::Attempt { .. }) => surprise("the model began the answer again before its first clause closed"),
+            (FirstAttempt::Done, _) => None,
+        }
+    }
+}
+
+/// Waits for the answer to the question asked, until `deadline`. Looks up every `POLL` to see
+/// whether the core is shutting down, so a turn in flight never keeps the core from leaving.
+///
+/// `first` is called at most once, with the stream's first clause and when the piece that closed it
+/// was read, or with why there will be none. It runs on this thread and the reader goes on reading
+/// meanwhile, so a `result` that arrives while it runs waits in the queue: one read by the deadline
+/// is still the answer, one read after it is not.
+pub fn await_answer(msgs: &Receiver<Msg>, deadline: Instant, stop: &AtomicBool, first: &mut dyn FnMut(Result<Clause, String>, Instant)) -> Result<(Value, Instant), Wait> {
+    let mut attempt = FirstAttempt::Waiting;
     loop {
         if stop.load(Ordering::Relaxed) {
             return Err(Wait::Stopped);
         }
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(Wait::Timeout);
-        }
-        match msgs.recv_timeout(left.min(POLL)) {
-            Ok(Msg::Result(value)) => return Ok(value),
+        let msg = if left.is_zero() {
+            msgs.try_recv().map_err(|e| match e {
+                TryRecvError::Empty => RecvTimeoutError::Timeout,
+                TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+            })
+        } else {
+            msgs.recv_timeout(left.min(POLL))
+        };
+        match msg {
+            Ok(Msg::Result(value, read)) if read <= deadline => return Ok((value, read)),
+            Ok(Msg::Result(..)) => return Err(Wait::Timeout),
+            // Nothing is voiced past the deadline: the turn has failed by then.
+            Ok(Msg::Stream(moment, read)) if !left.is_zero() => {
+                if let Some(heard) = attempt.hear(moment) {
+                    first(heard, read);
+                }
+            }
             Ok(Msg::Bad(why)) => return Err(Wait::Bad(why)),
             Ok(Msg::Ended(why)) => return Err(Wait::Ended(why)),
-            Ok(Msg::Raw(_)) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Msg::Stream(..) | Msg::Raw(_)) => {}
+            Err(RecvTimeoutError::Timeout) if left.is_zero() => return Err(Wait::Timeout),
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Err(Wait::Ended(None)),
         }
     }
@@ -333,17 +431,18 @@ impl Proc {
                 Ok(Msg::Raw(line)) => return Ok(line),
                 Ok(Msg::Bad(why)) => return Err(Wait::Bad(why)),
                 Ok(Msg::Ended(why)) => return Err(Wait::Ended(why)),
-                Ok(Msg::Result(_)) | Err(RecvTimeoutError::Timeout) => {}
+                Ok(Msg::Result(..) | Msg::Stream(..)) | Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Err(Wait::Ended(None)),
             }
         }
     }
 
-    /// Hands over one sentence and waits for the `result` message that answers it.
-    pub fn ask(&mut self, text: &str, limit: Duration, stop: &AtomicBool) -> Result<Value, Failure> {
+    /// Hands over one sentence and waits for the `result` message that answers it, `limit` from
+    /// now, and returns it with when it was read. `first` is `await_answer`'s.
+    pub fn ask(&mut self, text: &str, limit: Duration, stop: &AtomicBool, first: &mut dyn FnMut(Result<Clause, String>, Instant)) -> Result<(Value, Instant), Failure> {
         self.write(text).map_err(Failure::Broken)?;
-        match await_result(&self.msgs, limit, stop) {
-            Ok(message) => Ok(message),
+        match await_answer(&self.msgs, Instant::now() + limit, stop, first) {
+            Ok(answered) => Ok(answered),
             Err(Wait::Stopped) => Err(Failure::Stopped),
             Err(Wait::Timeout) => {
                 Err(Failure::Broken(format!("claude did not answer within {} seconds, so it was stopped", limit.as_secs())))
@@ -410,11 +509,14 @@ fn read_stdout(stdout: ChildStdout, tx: Sender<Msg>, started: Instant, cwd: &Pat
     let mut announced = false;
     loop {
         buf.clear();
-        let msg = match input.read_until(b'\n', &mut buf) {
+        let got = input.read_until(b'\n', &mut buf);
+        let read = Instant::now();
+        let msg = match got {
             Ok(0) => Msg::Ended(None),
             Err(e) => Msg::Ended(Some(e.to_string())),
             Ok(_) => match classify(&buf) {
-                Line::Result(value) => Msg::Result(value),
+                Line::Result(value) => Msg::Result(value, read),
+                Line::Stream(moment) => Msg::Stream(moment, read),
                 Line::Bad(why) => Msg::Bad(why),
                 Line::Init(init) => {
                     // The CLI announces itself again at the start of every turn. Once is the news.

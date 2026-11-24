@@ -473,6 +473,7 @@ const SCENARIOS: &[Scenario] = &[
     ("an_https_service_that_is_not_there_is_named", an_https_service_that_is_not_there_is_named),
     ("claude_is_started_without_the_speech_key", claude_is_started_without_the_speech_key),
     ("a_long_answer_arrives_in_parts_each_in_its_own_voice", a_long_answer_arrives_in_parts_each_in_its_own_voice),
+    ("a_streamed_answer_is_said_in_the_words_a_whole_one_has", a_streamed_answer_is_said_in_the_words_a_whole_one_has),
     ("a_long_answer_with_no_voice_arrives_whole_and_silent", a_long_answer_with_no_voice_arrives_whole_and_silent),
     ("a_part_the_service_refuses_takes_the_rest_of_the_answer_silent", a_part_the_service_refuses_takes_the_rest_of_the_answer_silent),
     ("what_one_turn_learns_about_the_service_paces_the_next", what_one_turn_learns_about_the_service_paces_the_next),
@@ -526,6 +527,10 @@ const SCENARIOS: &[Scenario] = &[
     ("a_record_that_cannot_be_written_costs_the_turn_nothing", a_record_that_cannot_be_written_costs_the_turn_nothing),
     ("a_relay_turn_is_kept_without_what_she_asked_to_pass_on", a_relay_turn_is_kept_without_what_she_asked_to_pass_on),
     ("a_turn_the_core_is_stopped_in_is_kept_as_interrupted", a_turn_the_core_is_stopped_in_is_kept_as_interrupted),
+    ("the_opening_is_voiced_before_the_answer_is_whole_and_said_after", the_opening_is_voiced_before_the_answer_is_whole_and_said_after),
+    ("an_opening_is_heard_only_as_part_of_the_answer_that_passed", an_opening_is_heard_only_as_part_of_the_answer_that_passed),
+    ("an_opening_before_a_relay_ask_is_never_heard", an_opening_before_a_relay_ask_is_never_heard),
+    ("a_short_opening_stands_a_refused_one_silences_the_turn_and_an_unstreamed_answer_has_none", a_short_opening_stands_a_refused_one_silences_the_turn_and_an_unstreamed_answer_has_none),
 ];
 
 fn transport_with_the_echo_engine() -> Result<String, String> {
@@ -699,6 +704,10 @@ fn claude_is_started_with_the_measured_flags_intact() -> Result<String, String> 
         }
         if !args.iter().any(|a| a == "--verbose") {
             return Err("--verbose is missing".to_string());
+        }
+        let streamed = args.iter().filter(|a| *a == "--include-partial-messages").count();
+        if streamed != 1 {
+            return Err(format!("--include-partial-messages should be there once, so the answer streams in as it is written; it is there {streamed} times"));
         }
         if args.iter().any(|a| a == "--effort") {
             return Err("--effort is there, and how long the model thinks is not what is being changed".to_string());
@@ -938,6 +947,9 @@ struct FakeSpeech {
     heard: Mutex<Vec<(String, Value)>>,
     /// The `Authorization` header of each of those requests, in the same order.
     authorized: Mutex<Vec<Option<String>>>,
+    /// How many of those requests have had their answer written back. One listener answers them
+    /// in turn, so the first `answered` of `heard` are the ones answered.
+    answered: Mutex<usize>,
 }
 
 /// Three frames, silent, loud and half as loud, and ten samples that make no frame: the envelope a
@@ -969,6 +981,7 @@ impl FakeSpeech {
             answer: Mutex::new(Answer::Wav(fake_clip())),
             heard: Mutex::new(Vec::new()),
             authorized: Mutex::new(Vec::new()),
+            answered: Mutex::new(0),
         });
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -1027,6 +1040,26 @@ impl FakeSpeech {
         let head = format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len());
         let mut out = &stream;
         let _ = out.write_all(head.as_bytes()).and_then(|()| out.write_all(&payload)).and_then(|()| out.flush());
+        if let Ok(mut answered) = self.answered.lock() {
+            *answered += 1;
+        }
+    }
+
+    /// Waits until a request for `input`, made since `before`, has had its answer written back.
+    fn wait_answered(&self, before: usize, input: &str) -> Result<(), String> {
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        loop {
+            let heard = self.heard();
+            let at = heard.iter().enumerate().skip(before).find(|(_, (_, body))| body["input"] == input).map(|(at, _)| at);
+            if at.is_some_and(|at| self.answered.lock().is_ok_and(|n| *n > at)) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let asked: Vec<&Value> = heard[before.min(heard.len())..].iter().map(|(_, body)| &body["input"]).collect();
+                return Err(format!("the service was not asked for {input:?} within {STEP_TIMEOUT:?}, it was asked for {asked:?}"));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Runs `body` with the fake answering `answer`, and puts the clip back whatever happens.
@@ -1292,6 +1325,18 @@ fn long_parts() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// The same answer when its first clause is voiced while the rest is written: the head of that
+/// clause is part 0, and the rest of the clause is a part of its own.
+fn head_parts() -> Vec<(&'static str, Value)> {
+    vec![
+        ("[self]好熱喔，", json!(["self"])),
+        ("我懂那種不想動的感覺。", json!([])),
+        ("[offer]要不要先待在家吹冷氣，", json!(["offer"])),
+        ("喝點冰的，", json!([])),
+        ("[nod]等傍晚涼一點再出去走走？", json!(["nod"])),
+    ]
+}
+
 fn inputs_since(fake: &FakeSpeech, before: usize) -> Vec<Value> {
     fake.heard()[before..].iter().map(|(_, body)| body["input"].clone()).collect()
 }
@@ -1315,6 +1360,44 @@ fn a_long_answer_arrives_in_parts_each_in_its_own_voice() -> Result<String, Stri
         return Err(format!("the service should be asked once per part for that part's words without markers, {want:?}; it was asked for {asked:?}"));
     }
     Ok(format!("long_answer_in_4_parts={:.0}ms", ms(took)))
+}
+
+/// An answer that streams in piece by piece, as the real CLI's does, says the words the same answer
+/// has whole, its head first, and the core sees its first clause close before the answer ends.
+fn a_streamed_answer_is_said_in_the_words_a_whole_one_has() -> Result<String, String> {
+    let fake = FakeSpeech::get()?;
+    let before = fake.heard().len();
+    let stderr = with_stub("streamed", |client| {
+        client.say("stream:long")?;
+        client.expect_parts("the long answer, streamed", &head_parts())?;
+        client.say("stream:ok")?;
+        client.expect_parts("the ok answer, streamed", &[("[nod]收到", json!(["nod"])), ("[offer]我在這裡", json!(["offer"]))])?;
+        client.say("gate:retry-other")?;
+        client.expect_turn("an answer the CLI asked for twice, with nobody holding it", OK_TURN, json!(["nod", "offer"]))?;
+        client.shutdown()?;
+        Ok(client.stop())
+    })?;
+    let asked = inputs_since(fake, before);
+    let want = [
+        "好熱喔，",
+        "我懂那種不想動的感覺。",
+        "要不要先待在家吹冷氣，",
+        "喝點冰的，",
+        "等傍晚涼一點再出去走走？",
+        "收到",
+        "我在這裡",
+        "好熱喔，",
+        "收到 我在這裡",
+    ];
+    if asked != want.map(Value::from) {
+        return Err(format!("the service should be asked for each part's words, the head of the first clause first, {want:?}; it was asked for {asked:?}"));
+    }
+    let lines: Vec<&str> = stderr.lines().filter(|l| l.contains("first clause closed at") || l.contains("claude answered in")).collect();
+    let order: Vec<bool> = lines.iter().map(|l| l.contains("first clause closed at")).collect();
+    if order != [true, false, true, false, true, false] {
+        return Err(format!("each streamed turn should log its first clause closing and then its answer, it logged {lines:?}"));
+    }
+    Ok(String::new())
 }
 
 fn a_long_answer_with_no_voice_arrives_whole_and_silent() -> Result<String, String> {
@@ -2912,6 +2995,256 @@ fn a_turn_the_core_is_stopped_in_is_kept_as_interrupted() -> Result<String, Stri
     kept_as(&lines[0], json!({ "v": 1, "turn": 1, "user": { "text": "hang", "via": "text" }, "reply": null, "outcome": "interrupted", "engine": engine }), "the turn the core was stopped in")?;
     if ms_keys(&lines[0]) != ["done"] || lines[0]["gap_ms"] != Value::Null {
         return Err(format!("a stopped turn has only done in ms, and the first turn of a core has no gap: {}", lines[0]));
+    }
+    Ok(String::new())
+}
+
+// The opening voiced while the answer is written (Docs/DESIGN_ChatCore.md §15). The stand-in holds
+// a `gate:` answer after its first clause, so what the core does before the answer is whole can be
+// seen in order, with no guess at how long anything takes.
+
+impl Client {
+    /// Nothing on stdout for `within`, when what is being ruled out would have been sent at once.
+    fn quiet_for(&mut self, within: Duration, what: &str) -> Result<(), String> {
+        match self.lines.recv_timeout(within) {
+            Ok(Ok(line)) => Err(format!("{what}, and yet the core sent {line}")),
+            Ok(Err(e)) => Err(format!("reading stdout: {e}")),
+            Err(RecvTimeoutError::Timeout) => Ok(()),
+            Err(RecvTimeoutError::Disconnected) => Err(format!("{what}, and yet the core closed stdout")),
+        }
+    }
+}
+
+/// The file a held answer of the stand-in waits for (`stub::GATE_ENV`).
+struct Gate(PathBuf);
+
+impl Gate {
+    /// Shut again for the next held answer.
+    fn close(&self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(stub::held_at(&self.0));
+    }
+
+    fn open(&self) -> Result<(), String> {
+        std::fs::write(&self.0, b"").map_err(|e| format!("opening the gate {}: {e}", self.0.display()))
+    }
+
+    fn env(&self) -> [(&'static str, &str); 1] {
+        [(stub::GATE_ENV, self.0.to_str().unwrap_or_default())]
+    }
+}
+
+/// Long enough for a core that sends as soon as it has a voice to have sent it: everything here is
+/// on loopback and answers in milliseconds.
+const AT_ONCE: Duration = Duration::from_millis(300);
+
+/// What each turn's part 0 line, or its line for a turn that says nothing, says became of the
+/// opening, in order.
+fn openings(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter_map(|line| line.split_once("opening=").map(|(_, rest)| rest.split(|c: char| c == ')' || c.is_whitespace()).next().unwrap_or_default().to_string()))
+        .collect()
+}
+
+/// The order the whole turn rests on: the opening, the first clause up to its first comma, is asked
+/// of the service while the stand-in still holds the rest of the answer, so it was voiced before the
+/// answer was whole, and nothing is sent until the answer has come and passed its checks. The rest of
+/// that clause is a part of its own.
+fn the_opening_is_voiced_before_the_answer_is_whole_and_said_after() -> Result<String, String> {
+    let root = Gone::fresh("opening")?;
+    let gate = Gate(root.0.join("gate"));
+    let fake = FakeSpeech::get()?;
+    let file = root.0.join("dialogue.jsonl");
+    // Behind the fake's 61 ms clip each part after the opening is one atom.
+    let want = ["好熱喔，", "我懂那種不想動的感覺。", "要不要先待在家吹冷氣，", "喝點冰的，", "等傍晚涼一點再出去走走？"];
+    let stderr = with_core_configured(Mode::Stub { log: root.0.join("stub.log"), model: None }, &fake.url, &gate.env(), |client| {
+        client.expect_ready()?;
+        gate.close();
+        let before = fake.heard().len();
+        client.say_kept("gate:long", &file, "mic")?;
+        fake.wait_answered(before, want[0])?;
+        client.quiet_for(AT_ONCE, "the opening was voiced and the answer is not whole")?;
+        gate.open()?;
+        client.expect_parts("the long answer, its opening as part 0", &head_parts())?;
+        let asked = inputs_since(fake, before);
+        if asked != want.map(Value::from) {
+            return Err(format!("the opening should be part 0 and not asked for again, {want:?}; the service was asked for {asked:?}"));
+        }
+        client.shutdown()?;
+        Ok(client.stop())
+    })?;
+    if openings(&stderr) != ["reused"] {
+        return Err(format!("part 0 should say the opening was reused, it said {:?}", openings(&stderr)));
+    }
+    let at = |needle: &str| stderr.find(needle);
+    if !matches!((at("first clause closed at"), at("opening ready at"), at("claude answered in")), (Some(a), Some(b), Some(c)) if a < b && b < c) {
+        return Err(format!("the first clause should close, then the opening be ready, then the answer come: {stderr}"));
+    }
+    let lines = kept_lines(&file)?;
+    let ms = |key: &str| lines.first().and_then(|l| l["ms"][key].as_f64()).unwrap_or(-1.0);
+    if lines.len() != 1 || lines[0]["outcome"] != "answered" || !(0.0 <= ms("engine") && ms("engine") <= ms("first_audio") && ms("first_audio") <= ms("done")) {
+        return Err(format!("the turn should be kept as answered, with engine <= first_audio <= done as for any turn: {lines:?}"));
+    }
+    Ok(String::new())
+}
+
+/// Behind the gate, once the opening has been voiced, each way the answer can still come to
+/// nothing or change. Each turn ends as it would have with no opening at all, nothing of the opening
+/// is on the wire unless the answer it opens is the one said, and the record keeps what the turn came
+/// to. The last one kills the process, and the next sentence is answered by another.
+fn an_opening_is_heard_only_as_part_of_the_answer_that_passed() -> Result<String, String> {
+    let root = Gone::fresh("opening-after")?;
+    let gate = Gate(root.0.join("gate"));
+    let file = root.0.join("dialogue.jsonl");
+    let fake = FakeSpeech::get()?;
+    // Each turn's word, its opening, and every request the service hears in the turn: a voice is
+    // made only for what is said, apart from the opening.
+    let turns: [(&str, &str, &[&str]); 6] = [
+        ("gate:bracket", "好的", &["好的"]),
+        ("gate:four", "一", &["一"]),
+        ("gate:error", "收到", &["收到"]),
+        ("gate:retry-same", "好熱喔，", &["好熱喔，", "我懂那種不想動的感覺。", "要不要先待在家吹冷氣，", "喝點冰的，", "等傍晚涼一點再出去走走？"]),
+        ("gate:retry-other", "好熱喔，", &["好熱喔，", "收到 我在這裡"]),
+        ("gate:die", "收到", &["收到"]),
+    ];
+    let stderr = with_core_configured(Mode::Stub { log: root.0.join("stub.log"), model: None }, &fake.url, &gate.env(), |client| {
+        client.expect_ready()?;
+        for (word, opening, voiced) in turns {
+            gate.close();
+            let before = fake.heard().len();
+            client.say_kept(word, &file, "text")?;
+            fake.wait_answered(before, opening)?;
+            gate.open()?;
+            match word {
+                "gate:bracket" => client.expect_error("a later clause with a bracket", &["clauses[1].text contains"])?,
+                "gate:four" => client.expect_error("a fourth clause", &["4 clauses", "at most 3"])?,
+                "gate:error" => client.expect_error("claude failing after the first clause", &["the stub failed on purpose"])?,
+                "gate:retry-same" => client.expect_parts("a second attempt that opens the same", &head_parts())?,
+                "gate:retry-other" => client.expect_turn("a second attempt that opens otherwise", OK_TURN, json!(["nod", "offer"]))?,
+                _ => client.expect_error("claude dying after the first clause", &["claude exited (code 3)", "boom: the stub died on purpose"])?,
+            }
+            let asked = inputs_since(fake, before);
+            if asked != voiced.iter().map(|v| Value::from(*v)).collect::<Vec<_>>() {
+                return Err(format!("{word}: the service should be asked for {voiced:?}, it was asked for {asked:?}"));
+            }
+        }
+        client.say_kept("ok", &file, "text")?;
+        client.expect_turn("the sentence after the death, from a new process", OK_TURN, json!(["nod", "offer"]))?;
+        client.shutdown()?;
+        Ok(client.stop())
+    })?;
+    let want = ["dropped:refused", "dropped:refused", "dropped:failed", "reused", "dropped:changed", "dropped:failed", "none"];
+    if openings(&stderr) != want {
+        return Err(format!("what became of each opening should be {want:?}, the core said {:?}", openings(&stderr)));
+    }
+    let lines = kept_lines(&file)?;
+    let engine = json!({ "kind": "claude", "model": serve::DEFAULT_MODEL });
+    let reply = |clauses: &[&str]| json!({ "clauses": clauses, "language": "zh-TW", "affect": "calm" });
+    let long = reply(&["好熱喔，我懂那種不想動的感覺。", "要不要先待在家吹冷氣，喝點冰的，", "等傍晚涼一點再出去走走？"]);
+    let kept = [
+        ("gate:bracket", Value::Null, "refused"),
+        ("gate:four", Value::Null, "refused"),
+        ("gate:error", Value::Null, "failed"),
+        ("gate:retry-same", long, "answered"),
+        ("gate:retry-other", reply(&["收到", "我在這裡"]), "answered"),
+        ("gate:die", Value::Null, "failed"),
+        ("ok", reply(&["收到", "我在這裡"]), "answered"),
+    ];
+    if lines.len() != kept.len() {
+        return Err(format!("{} turns asked to be kept, the record has {} lines: {lines:?}", kept.len(), lines.len()));
+    }
+    for (n, (line, (text, reply, outcome))) in lines.iter().zip(kept).enumerate() {
+        let said = outcome == "answered";
+        let want = json!({ "v": 1, "turn": n + 1, "user": { "text": text, "via": "text" }, "reply": reply, "outcome": outcome, "engine": engine });
+        kept_as(line, want, &format!("the record of {text}"))?;
+        let shape: &[&str] = if said { &["audio", "done", "engine", "first_audio"] } else { &["done", "engine"] };
+        if ms_keys(line) != shape {
+            return Err(format!("the record of {text} should hold {shape:?} in ms, it holds {}", line["ms"]));
+        }
+        let ms = |key: &str| line["ms"][key].as_f64().unwrap_or(-1.0);
+        if said && !(ms("engine") <= ms("first_audio") && ms("first_audio") <= ms("done")) {
+            return Err(format!("the record of {text} should run engine <= first_audio <= done: {}", line["ms"]));
+        }
+    }
+    Ok(String::new())
+}
+
+/// A relay ask written after an opening was voiced: the relay is asked, nothing she wrote is said,
+/// and the record keeps no word of it, as on any relay turn.
+fn an_opening_before_a_relay_ask_is_never_heard() -> Result<String, String> {
+    let root = Gone::fresh("opening-relay")?;
+    let gate = Gate(root.0.join("gate"));
+    let file = root.0.join("dialogue.jsonl");
+    let fake = FakeSpeech::get()?;
+    let env = gate.env();
+    let stderr = with_courier("opening-relay", "faithful", None, &env, |client, _| {
+        gate.close();
+        let before = fake.heard().len();
+        client.say_kept("gate:relayask", &file, "mic")?;
+        fake.wait_answered(before, "已經幫你傳了")?;
+        gate.open()?;
+        client.expect("her relay ask", json!({ "ev": "relay_asked", "to": "AImate 那個 session", "text": "設定頁的主題做好了，可以看了。" }))?;
+        client.expect("and the end of a turn that said nothing", json!({ "ev": "turn_end" }))?;
+        client.say("stream:long")?;
+        client.expect_parts("the next sentence, its opening as part 0", &head_parts())?;
+        if let Some(line) = client.transcript.iter().find(|l| l.contains("已經幫你傳了")) {
+            return Err(format!("the opening of a relay turn reached the wire: {line}"));
+        }
+        client.shutdown()?;
+        Ok(client.stop())
+    })?;
+    if openings(&stderr) != ["dropped:relay", "reused"] {
+        return Err(format!("the relay turn's opening should be dropped and the next one's reused, the core said {:?}", openings(&stderr)));
+    }
+    let lines = kept_lines(&file)?;
+    if lines.len() != 1 || lines[0]["outcome"] != "relay_asked" || lines[0]["reply"] != Value::Null || ms_keys(&lines[0]) != ["done", "engine"] {
+        return Err(format!("the relay turn should be kept as relay_asked with no reply and nothing said: {lines:?}"));
+    }
+    Ok(String::new())
+}
+
+/// An opening the answer cannot make the most of. A greeting too short to cover the clause behind
+/// it is kept, pause and all. An opening the service could not voice makes the whole answer one
+/// silent part, and the service is asked nothing more. An answer that does not stream has no
+/// opening, and is today's turn.
+fn a_short_opening_stands_a_refused_one_silences_the_turn_and_an_unstreamed_answer_has_none() -> Result<String, String> {
+    let fake = FakeSpeech::get()?;
+    let before = fake.heard().len();
+    let kept = with_stub("opening-pause", |client| {
+        client.say("stream:hello")?;
+        let parts = [("[nod]早安呀！", json!(["nod"])), ("[offer]今天天氣很好，", json!(["offer"])), ("我們一起出去走走吧。", json!([]))];
+        client.expect_parts("a greeting in front of a longer clause, then one atom a part behind the fake's clip", &parts)?;
+        client.shutdown()?;
+        Ok(client.stop())
+    })?;
+    let asked = inputs_since(fake, before);
+    let want = ["早安呀！", "今天天氣很好，", "我們一起出去走走吧。"];
+    if asked != want.map(Value::from) || openings(&kept) != ["reused"] {
+        return Err(format!("the greeting should be part 0 whatever the pause behind it ({:?}), {want:?}; the service was asked for {asked:?}", openings(&kept)));
+    }
+    FakeSpeech::answering(Answer::RefusingInput("好熱喔，".to_string()), |fake| {
+        let before = fake.heard().len();
+        let silent = with_stub("opening-silent", |client| {
+            client.say("stream:long")?;
+            client.expect_silent("an opening the service refused", 0, LONG, json!(["self", "offer", "nod"]), &["HTTP 503"])?;
+            client.shutdown()?;
+            Ok(client.stop())
+        })?;
+        let asked = inputs_since(fake, before);
+        if asked.len() != 1 || openings(&silent) != ["silent"] {
+            return Err(format!("a refused opening should leave the answer silent with the service asked once; it was asked for {asked:?} and part 0 said {:?}", openings(&silent)));
+        }
+        Ok(())
+    })?;
+    let unstreamed = with_stub("opening-none", |client| {
+        client.say("long")?;
+        client.expect_parts("an answer that came whole", &long_parts())?;
+        client.shutdown()?;
+        Ok(client.stop())
+    })?;
+    if openings(&unstreamed) != ["none"] {
+        return Err(format!("an answer that did not stream has no opening, part 0 said {:?}", openings(&unstreamed)));
     }
     Ok(String::new())
 }
